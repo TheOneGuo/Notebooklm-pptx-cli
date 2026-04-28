@@ -4,10 +4,11 @@ description: |
   将 Markdown 研报一键转换为精美 PPT 的完整自动化流水线。
   支持：NotebookLM 笔记本创建、PPT 大纲生成、四任务并行生成（横版+竖版）、
   图片提取合并、前瞻客 Logo 遮盖、临时文件清理。
+  同时支持 ChatGPT 网页版自动化 6 轮行业研究 → MD 来源生成 → NotebookLM → PPTX 完整链路。
   触发词：生成PPT、MD转PPT、NotebookLM生成幻灯片、研报转PPT、
-  制作PPT、pptx生成、幻灯片制作、nb2pptx
+  制作PPT、pptx生成、幻灯片制作、nb2pptx、行业研究自动化、6轮分析
 author: "Gray / 前瞻客·Foresig"
-version: "1.3.0"
+version: "1.4.0"
 ---
 
 # NotebookLM → PPTX 流水线 Skill
@@ -72,15 +73,77 @@ python scripts/nb2pptx.py report.md --title "AI算力液冷赛道报告" --pages
 python scripts/nb2pptx.py report.md --keep-temp
 ```
 
+### `chatgpt_auto_research`
+
+ChatGPT 网页版自动化 6 轮行业研究脚本。通过 `agent-browser` (Playwright) 控制持久化 Profile 浏览器，自动完成 6 轮递进对话，最终输出 `research_source.md` 作为 NotebookLM 来源。
+
+**核心特点**:
+- 持久化 Chromium Profile，保持登录态（方案 A）
+- 多重回复完成检测（字数稳定 + "Stop generating" 消失）
+- 断点恢复支持（`--resume-from N`）
+- 6 轮结论自动继承注入后续轮次
+
+**用法**:
+```bash
+# 基本用法
+python scripts/chatgpt_auto_research.py --topic "固态电池产业链"
+
+# 从第3轮恢复
+python scripts/chatgpt_auto_research.py --topic "低空经济" --resume-from 3
+
+# 指定外部背景资料
+python scripts/chatgpt_auto_research.py --topic "人形机器人" --context-file background.md
+
+# 流水线模式：自动生成 MD 后传入 nb2pptx
+python scripts/chatgpt_auto_research.py --topic "固态电池" && \
+python scripts/nb2pptx.py ~/Documents/A股研报/固态电池/research_source.md
+```
+
+**参数**:
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--topic, -t` | 研究主题（必填） | - |
+| `--output-dir, -o` | 输出目录 | `~/Documents/A股研报/` |
+| `--resume-from` | 从第几轮恢复（1-6） | 1 |
+| `--headless` | 无头模式 | false |
+| `--chrome-path` | 指定 Chrome 路径 | - |
+| `--context-file` | 外部背景资料文件 | - |
+
+**输出结构**:
+```
+~/Documents/A股研报/<主题>/
+├── round_01_output.md     # 第一轮回复
+├── round_02_output.md     # 第二轮回复
+├── round_03_output.md     # ...
+├── round_04_output.md
+├── round_05_output.md
+├── round_06_output.md
+└── research_source.md      # 最终汇总 MD（NotebookLM 来源）
+```
+
+**技术细节**:
+- 回复完成检测：连续 5 次 snapshot 字数稳定 或 "Stop generating" 按钮消失 → 回复完成
+- 文本提取：JavaScript `document.querySelectorAll('[data-message-author-role="assistant"]')` → 取最后一条 `innerText`
+- 登录态：首次手动登录后持久化 Profile，后续自动复用；session 过期时脚本检测并引导重新登录
+- 超时策略：单轮默认 5 分钟超时，超时后尝试提取已有内容继续
+
+**已知限制**:
+- Cloudflare 验证页面可能阻断首次访问，需手动处理一次
+- ChatGPT DOM 更新后选择器可能失效，需定期检查兼容性
+- 无头模式下无法处理验证码，建议使用 `--headless` 仅在确认无验证码环境时使用
+
 ## 文件结构
 
 ```
 nb2pptx/
-├── SKILL.md              # 本文件
+├── SKILL.md                         # 本文件
+├── README.md                        # 完整使用文档
 ├── scripts/
-│   └── nb2pptx.py        # 主流水线脚本
-└── assets/
-    └── logo.png          # 默认前瞻客 Logo 底图
+│   ├── nb2pptx.py                  # 主流水线脚本（MD → PPTX）
+│   └── chatgpt_auto_research.py     # ChatGPT 自动化脚本（研究 → MD 来源）
+├── assets/
+│   └── logo.png                     # 默认前瞻客 Logo 底图
+└── .chatgpt-browser-profile/        # ChatGPT 持久化浏览器 Profile（自动创建）
 ```
 
 ## 输出结构
