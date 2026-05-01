@@ -427,6 +427,134 @@ def cover_logo_on_images(
     return success
 
 # ═══════════════════════════════════════════════════════════════════════
+# 免责声明绘制工具
+# ═══════════════════════════════════════════════════════════════════════
+
+def draw_disclaimer(
+    image_dir: Path,
+    orientation: str = "landscape",
+    font_size: int = 11,
+    text_color: tuple = (170, 170, 170),
+    bg_color: tuple = (30, 30, 30, 180),
+    margin: int = 8
+) -> int:
+    """
+    在图片底部绘制标准股市免责声明
+
+    参数：
+        image_dir: 图片目录
+        orientation: "landscape" (横版) 或 "portrait" (竖版)
+        font_size: 字号，默认 11
+        text_color: 文字颜色 RGB，默认 #AAAAAA 暗灰
+        bg_color: 背景颜色 RGBA，默认半透明深色
+        margin: 距底部边距（px），默认 8
+
+    返回：
+        成功处理的图片数量
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        print("❌ 需要安装 Pillow: pip install Pillow")
+        return 0
+
+    disclaimer_lines = [
+        "市场有风险，决策需独立；",
+        "股市有风险，入市需谨慎。"
+    ]
+
+    # 查找中文字体
+    font = None
+    font_paths = [
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    ]
+    for fp in font_paths:
+        if Path(fp).exists():
+            try:
+                font = ImageFont.truetype(fp, font_size)
+                break
+            except Exception:
+                continue
+    if font is None:
+        font = ImageFont.load_default()
+        print("   ⚠️ 未找到中文字体，使用默认字体（免责声明可能显示异常）")
+
+    images = sorted(image_dir.glob("P*.png"))
+    if not images:
+        print(f"⚠️ 未找到图片: {image_dir}/P*.png")
+        return 0
+
+    print(f"📝 正在绘制免责声明（{len(images)} 张图片）...")
+    success = 0
+
+    for img_path in images:
+        try:
+            img = Image.open(str(img_path)).convert("RGBA")
+            img_w, img_h = img.size
+            draw = ImageDraw.Draw(img)
+
+            # 计算文字区域
+            line_heights = []
+            line_widths = []
+            for line in disclaimer_lines:
+                bbox = draw.textbbox((0, 0), line, font=font)
+                line_widths.append(bbox[2] - bbox[0])
+                line_heights.append(bbox[3] - bbox[1])
+
+            text_w = max(line_widths)
+            text_h = sum(line_heights) + 4  # 行间距
+            line_spacing = 4
+
+            if orientation == "landscape":
+                # 横版：右下角对齐
+                text_x = img_w - text_w - margin - 10
+                text_y = img_h - text_h - margin - 4
+            else:
+                # 竖版：底部居中
+                text_x = (img_w - text_w) // 2
+                text_y = img_h - text_h - margin - 4
+
+            # 绘制半透明背景
+            pad = 6
+            bg_x1 = text_x - pad
+            bg_y1 = text_y - pad
+            bg_x2 = text_x + text_w + pad
+            bg_y2 = text_y + text_h + pad
+
+            # 创建背景遮罩
+            bg_overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            bg_draw = ImageDraw.Draw(bg_overlay)
+            bg_draw.rectangle([bg_x1, bg_y1, bg_x2, bg_y2], fill=bg_color)
+            img = Image.alpha_composite(img, bg_overlay)
+            draw = ImageDraw.Draw(img)
+
+            # 绘制文字
+            y_offset = text_y
+            for i, line in enumerate(disclaimer_lines):
+                if orientation == "landscape":
+                    draw.text((text_x, y_offset), line, fill=text_color, font=font)
+                else:
+                    # 竖版居中
+                    line_w = line_widths[i]
+                    lx = text_x + (text_w - line_w) // 2
+                    draw.text((lx, y_offset), line, fill=text_color, font=font)
+                y_offset += line_heights[i] + line_spacing
+
+            img.convert("RGB").save(str(img_path), optimize=True)
+            success += 1
+
+        except Exception as e:
+            print(f"   ✗ {img_path.name}: {e}")
+
+    print(f"✅ 免责声明绘制完成: {success}/{len(images)}")
+    return success
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # 主流程
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -719,7 +847,7 @@ def main(
                     print(f"   ⚠️ 第{retry+1}次查询未找到 {task_name} artifact，{'重试中...' if retry < 4 else '将在下载后检查内容'}")
             
             if not artifact_id:
-                print(f"   ⚠️ 无法记录 {task_name} artifact ID，将在下载后检查内容")
+                raise RuntimeError(f"{task_name} artifact ID 获取失败（5次重试均未找到），中止")
             return artifact_id, excluded_ids
         
         # 按顺序提交 4 个任务，每个都追踪 artifact ID
@@ -916,7 +1044,7 @@ def main(
         # 横版页数校验
         all_images_h = sorted(images_dir_h.glob("P*.png"), key=lambda x: int(x.stem[1:]))
         if len(all_images_h) != pages:
-            print(f"   ⚠️ 横版图片数 {len(all_images_h)} ≠ 预期 {pages}，可能丢页")
+            raise RuntimeError(f"横版图片数 {len(all_images_h)} ≠ 预期 {pages}，丢页中止")
         if logo_path:
             print("      → 遮盖横版 NotebookLM Logo...")
             cover_h = cover_logo_on_images(images_dir_h, logo_path)
@@ -924,6 +1052,8 @@ def main(
                 print(f"   ⚠️ 横版部分图片遮盖失败: {cover_h}/{len(all_images_h)}")
         else:
             print("      ⏭️ 跳过 Logo 遮盖（Logo 文件不存在）")
+        print("      → 绘制横版免责声明...")
+        draw_disclaimer(images_dir_h, orientation="landscape")
         final_pptx_h = final_output_dir / f"{notebook_title}_横版.pptx"
         create_pptx_from_images(all_images_h, final_pptx_h, orientation="landscape")
         
@@ -950,7 +1080,7 @@ def main(
         # 竖版页数校验
         all_images_v = sorted(images_dir_v.glob("P*.png"), key=lambda x: int(x.stem[1:]))
         if len(all_images_v) != pages:
-            print(f"   ⚠️ 竖版图片数 {len(all_images_v)} ≠ 预期 {pages}，可能丢页")
+            raise RuntimeError(f"竖版图片数 {len(all_images_v)} ≠ 预期 {pages}，丢页中止")
         if logo_path:
             print("      → 遮盖竖版 NotebookLM Logo...")
             cover_v = cover_logo_on_images(images_dir_v, logo_path)
@@ -958,6 +1088,8 @@ def main(
                 print(f"   ⚠️ 竖版部分图片遮盖失败: {cover_v}/{len(all_images_v)}")
         else:
             print("      ⏭️ 跳过 Logo 遮盖（Logo 文件不存在）")
+        print("      → 绘制竖版免责声明...")
+        draw_disclaimer(images_dir_v, orientation="portrait")
         final_pptx_v = final_output_dir / f"{notebook_title}_竖版.pptx"
         create_pptx_from_images(all_images_v, final_pptx_v, orientation="portrait")
         
@@ -983,14 +1115,6 @@ def main(
         h_count = len(all_images_h)
         v_count = len(all_images_v)
         warnings = []
-        if h_count != pages:
-            warnings.append(f"横版页数 {h_count} ≠ 预期 {pages}")
-        if v_count != pages:
-            warnings.append(f"竖版页数 {v_count} ≠ 预期 {pages}")
-        if h_count == 0:
-            warnings.append("横版无图片")
-        if v_count == 0:
-            warnings.append("竖版无图片")
         for w in warnings:
             print(f"   ⚠️ {w}")
 

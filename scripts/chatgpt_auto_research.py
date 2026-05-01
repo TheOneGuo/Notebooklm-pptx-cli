@@ -99,7 +99,7 @@ ROUND_PROMPTS = [
 **研究主题：{topic}**
 
 **第一轮核心结论摘要：**
-{prev_summary}
+{{prev_summary}}
 
 请围绕第一轮建议的方向，对行业核心标的进行财务分析：
 
@@ -145,10 +145,10 @@ ROUND_PROMPTS = [
 **研究主题：{topic}**
 
 **第一轮核心结论：**
-{round1_summary}
+{{round1_summary}}
 
 **第二轮核心结论：**
-{round2_summary}
+{{round2_summary}}
 
 请围绕产能与资本开支方向深入分析：
 
@@ -184,13 +184,13 @@ ROUND_PROMPTS = [
 **研究主题：{topic}**
 
 **第一轮行业空间结论：**
-{round1_summary}
+{{round1_summary}}
 
 **第二轮财务与估值结论：**
-{round2_summary}
+{{round2_summary}}
 
 **第三轮产能与CAPEX结论：**
-{round3_summary}
+{{round3_summary}}
 
 请围绕四大壁垒深入分析：
 
@@ -228,7 +228,7 @@ ROUND_PROMPTS = [
 **研究主题：{topic}**
 
 **第四轮壁垒核心结论：**
-{round4_summary}
+{{round4_summary}}
 
 请围绕新赛道进入可行性展开分析：
 
@@ -281,7 +281,7 @@ ROUND_PROMPTS = [
 **研究主题：{topic}**
 
 **第五轮新赛道与平台化核心结论：**
-{round5_summary}
+{{round5_summary}}
 
 请从二级市场维度进行综合判断：
 

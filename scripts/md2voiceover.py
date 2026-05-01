@@ -26,7 +26,10 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
-import openai
+try:
+    import openai
+except ImportError:
+    openai = None  # 延迟报错：仅在实际调用 TTS/LLM 时报错，--help 可用
 
 # ═══════════════════════════════════════════════════════════════════════
 # 配置
@@ -46,6 +49,8 @@ class MiMoScriptGenerator:
     """用 mimo-v2.5-pro 生成口播稿"""
 
     def __init__(self, config_path: Path = CONFIG_PATH):
+        if openai is None:
+            raise ImportError("需要安装 openai: pip install openai")
         config = json.loads(config_path.read_text())
         self.client = openai.OpenAI(
             api_key=config["api_key"],
@@ -433,6 +438,8 @@ class VoiceCloneTTS:
     """MiMo-V2.5-TTS-VoiceClone 封装"""
 
     def __init__(self, config_path: Path = CONFIG_PATH):
+        if openai is None:
+            raise ImportError("需要安装 openai: pip install openai")
         config = json.loads(config_path.read_text())
         self.client = openai.OpenAI(
             api_key=config["api_key"],
@@ -463,11 +470,15 @@ class VoiceCloneTTS:
             return False
 
 
-def speed_up_audio(input_path: Path, output_path: Path, speed: float = SPEED):
-    subprocess.run(
+def speed_up_audio(input_path: Path, output_path: Path, speed: float = SPEED) -> bool:
+    result = subprocess.run(
         ["ffmpeg", "-y", "-i", str(input_path), "-filter:a", f"atempo={speed}", str(output_path)],
         capture_output=True,
     )
+    if result.returncode != 0:
+        print(f"   ⚠️ ffmpeg 加速失败: {result.stderr.decode()[:200]}")
+        return False
+    return True
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -506,18 +517,27 @@ def batch_synthesize(scripts_dir: Path, output_dir: Path, speed: float = SPEED):
             print(" ❌")
             continue
 
-        speed_up_audio(raw_wav, final_wav, speed)
+        if not speed_up_audio(raw_wav, final_wav, speed):
+            failed += 1
+            print(" ❌ (加速失败)")
+            continue
         raw_wav.unlink(missing_ok=True)
 
         result = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(final_wav)],
             capture_output=True, text=True,
         )
+        if result.returncode != 0 or not result.stdout.strip():
+            failed += 1
+            print(f" ❌ (ffprobe 失败)")
+            continue
         try:
             duration = float(json.loads(result.stdout)["format"]["duration"])
             print(f" ✅ {duration:.1f}s")
-        except:
-            print(" ✅")
+        except (KeyError, json.JSONDecodeError, ValueError):
+            failed += 1
+            print(" ❌ (时长解析失败)")
+            continue
 
         success += 1
         if i < len(txt_files):
