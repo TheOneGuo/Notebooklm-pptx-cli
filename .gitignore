@@ -10,3 +10,36 @@ Thumbs.db
 # Temp
 *.tmp
 *.temp
+
+# Project specific
+*.pptx
+*.pdf
+*.md.tmp
+memory/
+.consolidate-state.json
+.openclaw/
+
+# Task summaries
+task-summary-*.md
+task-summary_*.md
+
+# Workspace files
+AGENTS.md
+HEARTBEAT.md
+IDENTITY.md
+MEMORY.md
+SOUL.md
+TOOLS.md
+USER.md
+
+# Test/temp files
+test_*.py
+test-md-step1.md
+example_usage.py
+voice_sample_script.txt
+nb_pipeline.py
+merge_and_save.py
+merge_pptx.py
+pipeline.py
+output_*.wav
+*.skill
