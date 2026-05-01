@@ -35,7 +35,8 @@ version: "1.4.0"
 
 - **Python**: 3.11+
 - **NotebookLM CLI**: `notebooklm_cdp_cli`（已安装在独立虚拟环境）
-- **Python 库**: `python-pptx>=1.0.0`, `Pillow>=10.0.0`
+- **Python 库**: `pip install -r requirements.txt`（python-pptx, Pillow, openai）
+- **系统依赖**: `brew install ffmpeg`（配音加速用）
 
 ## 工具
 

@@ -35,7 +35,7 @@ python >= 3.11
 ~/.qclaw/workspace-agent-ef704e53/.venv/bin/notebooklm
 
 # Python 依赖
-pip install python-pptx>=1.0.0 Pillow>=10.0.0 openai>=1.0.0
+pip install -r requirements.txt
 
 # 系统依赖（配音加速用）
 brew install ffmpeg
@@ -46,7 +46,7 @@ brew install ffmpeg
 ```bash
 git clone https://github.com/TheOneGuo/Notebooklm-pptx-cli.git
 cd Notebooklm-pptx-cli
-pip install python-pptx Pillow openai
+pip install -r requirements.txt
 ```
 
 ### 使用方法

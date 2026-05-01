@@ -1,0 +1,15 @@
+# Notebooklm-pptx-cli 依赖清单
+# pip install -r requirements.txt
+
+# PPT 生成 & 图片处理（nb2pptx.py）
+python-pptx>=0.6.23
+Pillow>=10.0.0
+
+# MiMo LLM & TTS API（md2voiceover.py, mimo_voice_clone.py, chatgpt_auto_research.py）
+openai>=1.0.0
+
+# NotebookLM CLI（通过 pip 安装）
+notebooklm-cli>=0.1.0
+
+# 系统依赖（需手动安装，非 pip）
+# brew install ffmpeg   — 用于音频 1.5x 加速

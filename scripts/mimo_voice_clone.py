@@ -26,7 +26,10 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-import openai
+try:
+    import openai
+except ImportError:
+    openai = None  # 延迟报错：--help 可用，实际调用时检查
 
 
 class MiMoVoiceClone:
@@ -58,6 +61,8 @@ class MiMoVoiceClone:
     
     def _init_client(self):
         """初始化OpenAI客户端"""
+        if openai is None:
+            raise ImportError("需要安装 openai: pip install openai")
         if self.client is None:
             self.client = openai.OpenAI(
                 api_key=self.config['api_key'],
