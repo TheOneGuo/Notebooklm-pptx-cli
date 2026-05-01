@@ -42,3 +42,7 @@ merge_pptx.py
 pipeline.py
 output_*.wav
 *.skill
+
+# Local runtime artifacts
+scripts/.chatgpt-browser-profile/
+tmp/

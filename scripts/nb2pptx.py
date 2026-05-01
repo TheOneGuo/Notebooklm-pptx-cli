@@ -179,28 +179,67 @@ class NotebookLM:
     # ─── PPT 生成 ────────────────────────────────────────────────────
     
     def generate_slides(
-        self, 
-        source_id: str, 
+        self,
+        source_id: str,
         notebook_id: str,
         instructions: str,
-        fmt: str = "detailed_deck"
-    ) -> str:
-        """生成 PPT（不等待），返回 task ID"""
-        result = self.run([
+        fmt: str = "detailed_deck",
+        wait: bool = False,
+    ) -> Dict:
+        """提交 PPT 生成任务，返回 NotebookLM CLI 的 JSON 响应。"""
+        args = [
             "generate", "slide-deck",
             "--source", source_id,
             "--instructions", instructions,
             "--format", fmt,
-            "--no-wait",
+            "--wait" if wait else "--no-wait",
             "-n", notebook_id,
-            "--json"
-        ], timeout=30)
-        return result.get("task_id")
-    
+            "--json",
+        ]
+        timeout = 30 if not wait else 900
+        return self.run(args, timeout=timeout)
+
+    def wait_for_artifact(
+        self,
+        task_id: str,
+        notebook_id: str,
+        initial_interval: float = 2.0,
+        max_interval: float = 10.0,
+        timeout: float = 300.0,
+    ) -> Dict:
+        """等待 artifact 任务完成。"""
+        return self.run([
+            "artifact", "wait", task_id,
+            "-n", notebook_id,
+            "--initial-interval", str(initial_interval),
+            "--max-interval", str(max_interval),
+            "--timeout", str(timeout),
+            "--json",
+        ], timeout=int(timeout) + 30)
+
+    def revise_slide(
+        self,
+        artifact_id: str,
+        slide_index: int,
+        prompt: str,
+        notebook_id: str,
+        wait: bool = True,
+    ) -> Dict:
+        """请求 NotebookLM 单独重做某一页。"""
+        return self.run([
+            "generate", "revise-slide",
+            artifact_id,
+            str(slide_index),
+            prompt,
+            "-n", notebook_id,
+            "--wait" if wait else "--no-wait",
+            "--json",
+        ], timeout=900 if wait else 30)
+
     def download_slides(
-        self, 
-        output_path: Path, 
-        artifact_id: str, 
+        self,
+        output_path: Path,
+        artifact_id: str,
         notebook_id: str,
         fmt: str = "pptx"
     ) -> Path:
@@ -208,11 +247,11 @@ class NotebookLM:
         result = self.run([
             "download", "slide-deck", str(output_path),
             "--artifact-id", artifact_id,
-            "--format", "pptx",  # 强制使用 pptx 格式
+            "--format", fmt,
             "-n", notebook_id,
             "--json"
         ], timeout=60)
-        
+
         real_path = Path(result.get("output_path", output_path))
         return real_path
 
@@ -362,6 +401,168 @@ def copy_images_with_expected_count(
         output_paths.append(dst)
 
     return output_paths, warnings
+
+
+def resolve_artifact_id_from_submission(submission: Dict, artifacts: List[Dict], task_name: str) -> str:
+    """优先用 task_id / artifact_id 绑定任务，避免按可见顺序错配。"""
+    candidate_ids = [submission.get("artifact_id"), submission.get("task_id")]
+    artifact_map = {a.get("id"): a for a in artifacts if a.get("id")}
+
+    for candidate_id in candidate_ids:
+        if candidate_id and candidate_id in artifact_map:
+            return candidate_id
+
+    visible_artifact = submission.get("visible_artifact") or {}
+    visible_id = visible_artifact.get("id")
+    if visible_id and visible_id in artifact_map:
+        return visible_id
+
+    for candidate_id in candidate_ids:
+        if candidate_id:
+            return candidate_id
+
+    raise RuntimeError(f"{task_name} 未返回 task_id/artifact_id，无法稳定绑定生成结果")
+
+
+
+def validate_portrait_images(
+    images_dir: Path,
+    expected_pages: int,
+    deck_label: str,
+    page_numbers: Optional[List[int]] = None,
+) -> List[Dict[str, int]]:
+    """校验竖版图片是否全部为高大于宽。返回异常页列表。"""
+    from PIL import Image
+
+    if page_numbers is None:
+        image_paths = sorted(images_dir.glob("P*.png"), key=lambda x: int(x.stem[1:]))
+    else:
+        image_paths = [images_dir / f"P{page_number}.png" for page_number in page_numbers]
+
+    if len(image_paths) != expected_pages:
+        raise RuntimeError(f"{deck_label} 竖版图片数 {len(image_paths)} ≠ 预期 {expected_pages}")
+
+    missing = [path.name for path in image_paths if not path.exists()]
+    if missing:
+        raise RuntimeError(f"{deck_label} 缺少竖版图片: {', '.join(missing)}")
+
+    problems: List[Dict[str, int]] = []
+    for path in image_paths:
+        with Image.open(path) as img:
+            width, height = img.size
+        if height <= width:
+            page_number = int(path.stem[1:])
+            problems.append({
+                "page_number": page_number,
+                "width": width,
+                "height": height,
+            })
+
+    if problems:
+        details = ", ".join(
+            f"P{item['page_number']}({item['width']}x{item['height']})" for item in problems
+        )
+        raise RuntimeError(f"竖版页面方向校验失败：{deck_label} 存在横版页 -> {details}")
+
+    return problems
+
+
+
+def collect_pending_portrait_rerenders(deck_plan: Dict, images_dir: Path, expected_pages: int) -> List[Dict]:
+    """收集需要单页重做的竖版页。"""
+    from PIL import Image
+
+    page_numbers = list(range(deck_plan["page_start"], deck_plan["page_end"] + 1))
+    if len(page_numbers) != expected_pages:
+        raise RuntimeError(
+            f"{deck_plan['deck_label']} 页段长度 {len(page_numbers)} ≠ 预期 {expected_pages}"
+        )
+
+    image_paths = [images_dir / f"P{page_number}.png" for page_number in page_numbers]
+    missing = [path.name for path in image_paths if not path.exists()]
+    if missing:
+        raise RuntimeError(f"{deck_plan['deck_label']} 缺少竖版图片: {', '.join(missing)}")
+
+    rerenders = []
+    for path in image_paths:
+        with Image.open(path) as img:
+            width, height = img.size
+        if height > width:
+            continue
+
+        page_number = int(path.stem[1:])
+        slide_index = page_number - deck_plan["page_start"]
+        rerenders.append({
+            "task_id": deck_plan["task_id"],
+            "deck_label": deck_plan["deck_label"],
+            "artifact_id": deck_plan["artifact_id"],
+            "page_number": page_number,
+            "slide_index": slide_index,
+        })
+
+    return rerenders
+
+
+
+def rerender_portrait_slides(
+    nb: NotebookLM,
+    notebook_id: str,
+    deck_plan: Dict,
+    rerenders: List[Dict],
+    deck_pptx_path: Path,
+    images_dir: Path,
+    temp_dir: Path,
+) -> Path:
+    """要求 NotebookLM 对异常竖版页逐页重出，并重新下载整份 deck。"""
+    if not rerenders:
+        return deck_pptx_path
+
+    for item in rerenders:
+        prompt = (
+            f"请仅重做第{item['page_number']}页，严格改为竖版 9:16 纵向布局。"
+            "页面高度必须明显大于宽度，严禁横版。"
+            "请保持该页内容主题、页码顺序、中文文本、黑金/暗黑机械风格与原 deck 其它页面一致。"
+        )
+        print(
+            f"      ↻ 请求 NotebookLM 重做 {item['deck_label']} 的 P{item['page_number']} "
+            f"(slide_index={item['slide_index']})..."
+        )
+        result = nb.revise_slide(
+            artifact_id=deck_plan["artifact_id"],
+            slide_index=item["slide_index"],
+            prompt=prompt,
+            notebook_id=notebook_id,
+            wait=True,
+        )
+        status = result.get("status")
+        if status not in {"completed", "pending", "processing", None}:
+            raise RuntimeError(
+                f"{item['deck_label']} 第{item['page_number']}页重做失败: {result}"
+            )
+        revised_artifact_id = result.get("artifact_id") or result.get("task_id") or deck_plan["artifact_id"]
+        deck_plan["artifact_id"] = revised_artifact_id
+
+    refreshed_pptx = nb.download_slides(
+        temp_dir / f"{deck_plan['task_id']}_rerendered.pptx",
+        deck_plan["artifact_id"],
+        notebook_id,
+    )
+
+    if deck_pptx_path.exists():
+        shutil.copy2(refreshed_pptx, deck_pptx_path)
+
+    refreshed_extract_dir = temp_dir / f"images_{deck_plan['task_id']}_rerendered"
+    if refreshed_extract_dir.exists():
+        shutil.rmtree(refreshed_extract_dir)
+    extracted = extract_images_from_pptx(deck_pptx_path, refreshed_extract_dir)
+    copy_images_with_expected_count(
+        extracted,
+        images_dir,
+        start_page=deck_plan["page_start"],
+        expected_count=deck_plan["page_end"] - deck_plan["page_start"] + 1,
+        deck_label=deck_plan["deck_label"],
+    )
+    return deck_pptx_path
 
 # ═══════════════════════════════════════════════════════════════════════
 # Logo 遮盖工具
@@ -565,6 +766,46 @@ def draw_disclaimer(
 # 主流程
 # ═══════════════════════════════════════════════════════════════════════
 
+def build_ppt_prompt(orientation: str, page_start: int, page_end: int, is_first_half: bool, total_pages: int) -> str:
+    """构建 PPT 生成提示词。"""
+    if orientation == "landscape":
+        layout_rule = "横版（16:9）。页面宽度大于高度，适合PC端展示和宽屏投影。"
+        label = "横版"
+    else:
+        layout_rule = (
+            "必须严格使用竖版（9:16）纵向布局。页面高度明显大于宽度（高宽比约为1.77:1），"
+            "适合手机端短视频展示。所有内容必须纵向排列：大标题在页面上方，正文和图表垂直向下展开，"
+            "左右留白对称，充分利用竖向空间。严禁使用横版布局。"
+        )
+        label = "竖版"
+
+    content_verb = "先制作" if is_first_half else "制作"
+    style_ref = "来源b的大纲" if is_first_half else "来源b里的大纲"
+    consistency = "" if is_first_half else f"，要求和前{page_start - 1}页保持完全一致的风格和语言"
+
+    return f'''[LANGUAGE: CHINESE ONLY - 禁止使用任何英文]
+
+根据来源a的分析内容，按照{style_ref}制作PPT。这份PPT总共包含{total_pages}页。
+
+【强制语言要求】
+- 所有页面必须100%使用中文
+- 标题、正文、图表标签、页脚、按钮文字必须全部是中文
+- 严禁出现任何英文单词或字母
+- 如果必须使用专有名词，请用中文翻译
+
+【版式要求】{layout_rule}
+
+【风格要求】采用高端商务黑金/暗黑机械风格。背景使用深邃黑与暗灰色渐变，营造沉浸式暗室感。主体图表（如结构图、流程图）必须呈现 3D 拟物化的哑光红铜/古铜金属材质，避免亮金色。图表边缘需带有亮金色流光特效。整体画面需传达出极度沉稳、权威、严谨与精密的质感。
+
+【免责声明】所有页面底部必须显示以下文字（分两行）：
+市场有风险，决策需独立；
+股市有风险，入市需谨慎。
+
+【内容要求】要求插图丰富，确保每个中文字不要出错，字体清晰。研报中提到的所有公司名称、股票代码、核心数据必须在PPT中明确体现，不得遗漏。{content_verb}来源b要求的第{page_start}-{page_end}页{consistency}。
+
+【PPT标识】这是{label}PPT，包含第{page_start}-{page_end}页。'''
+
+
 def check_dependencies() -> List[str]:
     """检查运行依赖，返回缺失项列表"""
     missing = []
@@ -603,6 +844,9 @@ def main(
     title = title or md_file.stem
     logo_path = logo_path or DEFAULT_LOGO_PATH
     wait_config = wait_config or DEFAULT_WAIT_CONFIG
+    initial_interval = float(wait_config.get("initial_interval", DEFAULT_WAIT_CONFIG["initial_interval"]))
+    max_interval = float(wait_config.get("max_interval", DEFAULT_WAIT_CONFIG["max_interval"]))
+    timeout = float(wait_config.get("timeout", DEFAULT_WAIT_CONFIG["timeout"]))
 
     if not logo_path.exists():
         print(f"⚠️ Logo 文件不存在: {logo_path}，将跳过 Logo 遮盖")
@@ -759,262 +1003,139 @@ def main(
         # PPT 提示词（公共模板 + 4 个任务）
         # ═══════════════════════════════════════════════════════════════════
 
-        def build_ppt_prompt(orientation: str, page_start: int, page_end: int, is_first_half: bool) -> str:
-            """构建 PPT 生成提示词
+        task_plans = [
+            {
+                "task_id": "P1",
+                "task_name": "PPT 1（横版前半）",
+                "orientation": "landscape",
+                "deck_label": "横版前半",
+                "page_start": 1,
+                "page_end": pages_per_deck,
+                "output_temp_name": "ppt_h1.pptx",
+                "is_first_half": True,
+            },
+            {
+                "task_id": "P2",
+                "task_name": "PPT 2（横版后半）",
+                "orientation": "landscape",
+                "deck_label": "横版后半",
+                "page_start": pages_per_deck + 1,
+                "page_end": pages,
+                "output_temp_name": "ppt_h2.pptx",
+                "is_first_half": False,
+            },
+            {
+                "task_id": "P3",
+                "task_name": "PPT 3（竖版前半）",
+                "orientation": "portrait",
+                "deck_label": "竖版前半",
+                "page_start": 1,
+                "page_end": pages_per_deck,
+                "output_temp_name": "ppt_v1.pptx",
+                "is_first_half": True,
+            },
+            {
+                "task_id": "P4",
+                "task_name": "PPT 4（竖版后半）",
+                "orientation": "portrait",
+                "deck_label": "竖版后半",
+                "page_start": pages_per_deck + 1,
+                "page_end": pages,
+                "output_temp_name": "ppt_v2.pptx",
+                "is_first_half": False,
+            },
+        ]
 
-            Args:
-                orientation: "landscape" (横版16:9) 或 "portrait" (竖版9:16)
-                page_start: 起始页码
-                page_end: 结束页码
-                is_first_half: 是否为前半段（影响"先制作"vs"制作"措辞）
-            """
-            if orientation == "landscape":
-                layout_rule = "横版（16:9）。页面宽度大于高度，适合PC端展示和宽屏投影。"
-                label = "横版"
-            else:
-                layout_rule = (
-                    "必须严格使用竖版（9:16）纵向布局。页面高度明显大于宽度（高宽比约为1.77:1），"
-                    "适合手机端短视频展示。所有内容必须纵向排列：大标题在页面上方，正文和图表垂直向下展开，"
-                    "左右留白对称，充分利用竖向空间。严禁使用横版布局。"
-                )
-                label = "竖版"
-
-            content_verb = "先制作" if is_first_half else "制作"
-            style_ref = "来源b的大纲" if is_first_half else "来源b里的大纲"
-            consistency = "" if is_first_half else f"，要求和前{page_start - 1}页保持完全一致的风格和语言"
-
-            return f'''[LANGUAGE: CHINESE ONLY - 禁止使用任何英文]
-
-根据来源a的分析内容，按照{style_ref}制作PPT。这份PPT总共包含{pages}页。
-
-【强制语言要求】
-- 所有页面必须100%使用中文
-- 标题、正文、图表标签、页脚、按钮文字必须全部是中文
-- 严禁出现任何英文单词或字母
-- 如果必须使用专有名词，请用中文翻译
-
-【版式要求】{layout_rule}
-
-【风格要求】采用高端商务黑金/暗黑机械风格。背景使用深邃黑与暗灰色渐变，营造沉浸式暗室感。主体图表（如结构图、流程图）必须呈现 3D 拟物化的哑光红铜/古铜金属材质，避免亮金色。图表边缘需带有亮金色流光特效。整体画面需传达出极度沉稳、权威、严谨与精密的质感。
-
-【免责声明】所有页面底部必须显示以下文字（分两行）：
-市场有风险，决策需独立；
-股市有风险，入市需谨慎。
-
-【内容要求】要求插图丰富，确保每个中文字不要出错，字体清晰。研报中提到的所有公司名称、股票代码、核心数据必须在PPT中明确体现，不得遗漏。{content_verb}来源b要求的第{page_start}-{page_end}页{consistency}。
-
-【PPT标识】这是{label}PPT，包含第{page_start}-{page_end}页。'''
-
-        # 4 个 PPT 任务
-        ppt1_prompt = build_ppt_prompt("landscape", 1, pages_per_deck, is_first_half=True)
-        ppt2_prompt = build_ppt_prompt("landscape", pages_per_deck + 1, pages, is_first_half=False)
-        ppt3_prompt = build_ppt_prompt("portrait", 1, pages_per_deck, is_first_half=True)
-        ppt4_prompt = build_ppt_prompt("portrait", pages_per_deck + 1, pages, is_first_half=False)
+        for plan in task_plans:
+            plan["instructions"] = build_ppt_prompt(
+                plan["orientation"],
+                plan["page_start"],
+                plan["page_end"],
+                is_first_half=plan["is_first_half"],
+                total_pages=pages,
+            )
 
         # ═══════════════════════════════════════════════════════════════════
-        # 并行提交 4 个生成任务
+        # 提交 4 个生成任务，并用 task_id/artifact_id 稳定绑定
         # ═══════════════════════════════════════════════════════════════════
-        
-        def submit_and_track(task_name, prompt, excluded_ids):
-            """提交生成任务并追踪 artifact ID"""
-            print(f"\n   → 提交 {task_name} 生成任务...")
-            result = nb.run([
-                "generate", "slide-deck",
-                "--source", source_b_id,
-                "--instructions", prompt,
-                "--format", "detailed_deck",
-                "--no-wait",
-                "-n", notebook_id,
-                "--json"
-            ], timeout=30)
-            
-            artifact_id = None
-            for retry in range(5):
-                time.sleep(3 + retry * 2)
-                artifacts_resp = nb.run(["artifact", "list", "-n", notebook_id, "--json"], timeout=30)
-                artifacts_list = artifacts_resp.get("artifacts", [])
-                
-                new_artifacts = [
-                    a for a in artifacts_list
-                    if a.get("id") not in excluded_ids
-                ]
-                
-                if len(new_artifacts) >= 1:
-                    artifact_id = new_artifacts[0].get("id")
-                    status = new_artifacts[0].get("status")
-                    print(f"   ✅ {task_name} artifact 已创建: {artifact_id[:8]}... (状态: {status})")
-                    # 返回更新后的 excluded_ids（包含新发现的 artifact）
-                    new_excluded = excluded_ids | {a.get("id") for a in artifacts_list}
-                    return artifact_id, new_excluded
-                else:
-                    print(f"   ⚠️ 第{retry+1}次查询未找到 {task_name} artifact，{'重试中...' if retry < 4 else '将在下载后检查内容'}")
-            
-            if not artifact_id:
-                raise RuntimeError(f"{task_name} artifact ID 获取失败（5次重试均未找到），中止")
-            return artifact_id, excluded_ids
-        
-        # 按顺序提交 4 个任务，每个都追踪 artifact ID
-        # PPT 1（横版前半）
-        ppt1_artifact_id, excluded_after_ppt1 = submit_and_track(
-            "PPT 1（横版前半）", ppt1_prompt, initial_artifact_ids
-        )
-        
-        # PPT 2（横版后半）
-        ppt2_artifact_id, excluded_after_ppt2 = submit_and_track(
-            "PPT 2（横版后半）", ppt2_prompt, excluded_after_ppt1
-        )
-        
-        # PPT 3（竖版前半）
-        ppt3_artifact_id, excluded_after_ppt3 = submit_and_track(
-            "PPT 3（竖版前半）", ppt3_prompt, excluded_after_ppt2
-        )
-        
-        # PPT 4（竖版后半）
-        ppt4_artifact_id, excluded_after_ppt4 = submit_and_track(
-            "PPT 4（竖版后半）", ppt4_prompt, excluded_after_ppt3
-        )
-        
-        # ─── 等待 4 个 PPT 完成 ──────────────────────────────────────
+
+        def submit_and_track(plan: Dict) -> Dict:
+            print(f"\n   → 提交 {plan['task_id']} {plan['task_name']} 生成任务...")
+            submission = nb.generate_slides(
+                source_id=source_b_id,
+                notebook_id=notebook_id,
+                instructions=plan["instructions"],
+                fmt="detailed_deck",
+                wait=False,
+            )
+            print(f"   ↳ 提交结果: task_id={submission.get('task_id')} artifact_id={submission.get('artifact_id')}")
+            plan["submission"] = submission
+            return submission
+
+        for plan in task_plans:
+            submit_and_track(plan)
+
         print("\n   ⏳ 等待 PPT 生成完成...")
-        
-        # 状态码映射
-        STATUS_MAP = {0: "pending", 1: "processing", 2: "ready", 3: "completed", 4: "failed"}
-        
-        start_time = time.time()
-        timeout = wait_config.get("timeout", 1800)  # 4个PPT，超时改为30分钟
-        initial_interval = wait_config.get("initial_interval", 540)
-        max_interval = wait_config.get("max_interval", 60)
-        
-        # 初始静默等待
-        if initial_interval > 0:
-            print(f"   → 初始静默等待 {initial_interval}s...")
-            time.sleep(initial_interval)
-        
-        poll_count = 0
-        ppt1_completed = ppt1_artifact_id is None
-        ppt2_completed = ppt2_artifact_id is None
-        ppt3_completed = ppt3_artifact_id is None
-        ppt4_completed = ppt4_artifact_id is None
-        
-        while not (ppt1_completed and ppt2_completed and ppt3_completed and ppt4_completed):
-            elapsed = time.time() - start_time
-            if elapsed > timeout:
-                raise RuntimeError(f"PPT 生成超时（{timeout}s）")
-            
-            # 查询 artifact 列表
-            result = nb.run(["artifact", "list", "-n", notebook_id, "--json"], timeout=30)
-            artifacts = result.get("artifacts", [])
-            
-            # 创建 ID -> artifact 的映射
-            artifact_map = {a.get("id"): a for a in artifacts}
-            
-            # 检查 PPT 1 状态
-            if not ppt1_completed and ppt1_artifact_id and ppt1_artifact_id in artifact_map:
-                status_code = artifact_map[ppt1_artifact_id].get("status", 0)
-                if status_code == 3:
-                    print(f"   ✅ PPT 1（横版前半）已完成")
-                    ppt1_completed = True
-                elif status_code == 4:
-                    raise RuntimeError("PPT 1（横版前半）生成失败")
-            
-            # 检查 PPT 2 状态
-            if not ppt2_completed and ppt2_artifact_id and ppt2_artifact_id in artifact_map:
-                status_code = artifact_map[ppt2_artifact_id].get("status", 0)
-                if status_code == 3:
-                    print(f"   ✅ PPT 2（横版后半）已完成")
-                    ppt2_completed = True
-                elif status_code == 4:
-                    raise RuntimeError("PPT 2（横版后半）生成失败")
-            
-            # 检查 PPT 3 状态
-            if not ppt3_completed and ppt3_artifact_id and ppt3_artifact_id in artifact_map:
-                status_code = artifact_map[ppt3_artifact_id].get("status", 0)
-                if status_code == 3:
-                    print(f"   ✅ PPT 3（竖版前半）已完成")
-                    ppt3_completed = True
-                elif status_code == 4:
-                    raise RuntimeError("PPT 3（竖版前半）生成失败")
-            
-            # 检查 PPT 4 状态
-            if not ppt4_completed and ppt4_artifact_id and ppt4_artifact_id in artifact_map:
-                status_code = artifact_map[ppt4_artifact_id].get("status", 0)
-                if status_code == 3:
-                    print(f"   ✅ PPT 4（竖版后半）已完成")
-                    ppt4_completed = True
-                elif status_code == 4:
-                    raise RuntimeError("PPT 4（竖版后半）生成失败")
-            
-            # 如果全部完成，退出循环
-            if ppt1_completed and ppt2_completed and ppt3_completed and ppt4_completed:
-                break
-            
-            poll_count += 1
-            s1 = STATUS_MAP.get(artifact_map.get(ppt1_artifact_id, {}).get("status", 0), "unknown") if ppt1_artifact_id else "N/A"
-            s2 = STATUS_MAP.get(artifact_map.get(ppt2_artifact_id, {}).get("status", 0), "unknown") if ppt2_artifact_id else "N/A"
-            s3 = STATUS_MAP.get(artifact_map.get(ppt3_artifact_id, {}).get("status", 0), "unknown") if ppt3_artifact_id else "N/A"
-            s4 = STATUS_MAP.get(artifact_map.get(ppt4_artifact_id, {}).get("status", 0), "unknown") if ppt4_artifact_id else "N/A"
-            print(f"   → 第{poll_count}次轮询：横1={s1}, 横2={s2}, 竖1={s3}, 竖2={s4}")
-            
-            time.sleep(max_interval)
-        
-        # 方案C：如果无法记录ID，下载后检查内容
-        if not all([ppt1_artifact_id, ppt2_artifact_id, ppt3_artifact_id, ppt4_artifact_id]):
-            print("\n   ⚠️ 无法通过立即查询记录部分 artifact ID，将下载后检查内容（方案C）")
-        
-        print(f"\n   ✅ PPT 1（横版前半）: {ppt1_artifact_id}")
-        print(f"   ✅ PPT 2（横版后半）: {ppt2_artifact_id}")
-        print(f"   ✅ PPT 3（竖版前半）: {ppt3_artifact_id}")
-        print(f"   ✅ PPT 4（竖版后半）: {ppt4_artifact_id}")
-        
+        for plan in task_plans:
+            submission = plan["submission"]
+            task_id = submission.get("task_id") or submission.get("artifact_id")
+            if task_id:
+                wait_result = nb.wait_for_artifact(
+                    task_id,
+                    notebook_id,
+                    initial_interval=initial_interval,
+                    max_interval=max_interval,
+                    timeout=timeout,
+                )
+                status = wait_result.get("status")
+                if status == "failed":
+                    raise RuntimeError(f"{plan['task_name']} 生成失败: {wait_result.get('error') or wait_result}")
+                if wait_result.get("task_id"):
+                    plan["artifact_id"] = wait_result.get("task_id")
+            else:
+                print(f"   ⚠️ {plan['task_name']} 未返回 task_id，将在 artifact list 中按可见 artifact 兜底确认")
+
+        result = nb.run(["artifact", "list", "-n", notebook_id, "--json"], timeout=30)
+        artifacts = result.get("artifacts", [])
+        for plan in task_plans:
+            plan["artifact_id"] = resolve_artifact_id_from_submission(
+                plan["submission"],
+                artifacts,
+                task_name=plan["task_name"],
+            )
+            print(f"   ✅ {plan['task_id']} 绑定 artifact: {plan['artifact_id']}")
+
+        print("\n   ✅ 任务与 artifact 绑定结果：")
+        for plan in task_plans:
+            print(
+                f"      - {plan['task_id']}: {plan['task_name']} -> {plan['artifact_id']} "
+                f"(页段 {plan['page_start']}-{plan['page_end']})"
+            )
+
         # ─── Step 7: 下载 PPT ─────────────────────────────────────
         step_timer("7.下载PPT")
         print("\n[7/10] 下载 PPT...")
-        
+
         # 创建临时目录
         temp_dir = Path(tempfile.mkdtemp(prefix="nb2pptx_"))
         print(f"   📂 临时目录: {temp_dir}")
-        
-        def download_with_fallback(task_label, artifact_id, temp_name, excluded_ids_set):
-            """下载 PPT，如果 ID 缺失则通过内容识别"""
-            if artifact_id:
-                path = nb.download_slides(temp_dir / temp_name, artifact_id, notebook_id)
-                print(f"   ✅ {task_label}: {path.name}")
-                return path
-            
-            # 方案C：通过内容识别
-            print(f"   ⚠️ {task_label} ID 缺失，执行方案C...")
-            result = nb.run(["artifact", "list", "-n", notebook_id, "--json"], timeout=30)
-            artifacts = result.get("artifacts", [])
-            
-            candidates = [
-                a for a in artifacts
-                if a.get("status") == 3
-                and a.get("kind") == "slide_deck"
-                and a.get("id") not in excluded_ids_set
-            ]
-            
-            if not candidates:
-                raise RuntimeError(f"未找到 {task_label} 的 artifact")
-            
-            picked = candidates[0]
-            picked_id = picked.get("id")
-            path = nb.download_slides(temp_dir / temp_name, picked_id, notebook_id)
-            print(f"   ✅ {task_label} (方案C): {path.name}")
-            excluded_ids_set.add(picked_id)
-            return path
-        
-        excluded_ids = set(initial_artifact_ids)
-        
-        # 下载横版 PPT1 + PPT2
-        print("   → 下载横版 PPT...")
-        pptx_h1 = download_with_fallback("PPT 1（横版前半）", ppt1_artifact_id, "ppt_h1.pptx", excluded_ids)
-        pptx_h2 = download_with_fallback("PPT 2（横版后半）", ppt2_artifact_id, "ppt_h2.pptx", excluded_ids)
-        
-        # 下载竖版 PPT3 + PPT4
-        print("   → 下载竖版 PPT...")
-        pptx_v1 = download_with_fallback("PPT 3（竖版前半）", ppt3_artifact_id, "ppt_v1.pptx", excluded_ids)
-        pptx_v2 = download_with_fallback("PPT 4（竖版后半）", ppt4_artifact_id, "ppt_v2.pptx", excluded_ids)
-        
+
+        downloaded_pptx = {}
+        for plan in task_plans:
+            path = nb.download_slides(
+                temp_dir / plan["output_temp_name"],
+                plan["artifact_id"],
+                notebook_id,
+            )
+            downloaded_pptx[plan["task_id"]] = path
+            plan["pptx_path"] = path
+            print(f"   ✅ {plan['task_id']} {plan['task_name']}: {path.name}")
+
+        pptx_h1 = downloaded_pptx["P1"]
+        pptx_h2 = downloaded_pptx["P2"]
+        pptx_v1 = downloaded_pptx["P3"]
+        pptx_v2 = downloaded_pptx["P4"]
+
         # ─── Step 8: 保存原始 PPTX + 提取图片───────────────────────────
         step_timer("8.保存PPT+图片")
         print("\n[8/10] 保存原始 PPTX 并提取图片...")
@@ -1120,6 +1241,46 @@ def main(
         for warning in warnings_v1 + warnings_v2:
             print(f"      ⚠️ {warning}")
         
+        # 竖版逐份校验，并在发现横版页时单页重做后刷新对应原始 PPTX
+        portrait_deck_plans = [
+            {**task_plans[2], "pptx_output_key": "portrait_part1", "expected_pages": pages_per_deck},
+            {**task_plans[3], "pptx_output_key": "portrait_part2", "expected_pages": pages - pages_per_deck},
+        ]
+        for deck_plan in portrait_deck_plans:
+            page_numbers = list(range(deck_plan["page_start"], deck_plan["page_end"] + 1))
+            try:
+                validate_portrait_images(
+                    images_dir_v,
+                    expected_pages=deck_plan["expected_pages"],
+                    deck_label=deck_plan["task_name"],
+                    page_numbers=page_numbers,
+                )
+            except RuntimeError as exc:
+                print(f"      ⚠️ {exc}")
+                rerenders = collect_pending_portrait_rerenders(
+                    deck_plan,
+                    images_dir_v,
+                    expected_pages=deck_plan["expected_pages"],
+                )
+                if not rerenders:
+                    raise
+                deck_path = rerender_portrait_slides(
+                    nb,
+                    notebook_id,
+                    deck_plan,
+                    rerenders,
+                    deck_pptx_path=final_pptx_files[deck_plan["pptx_output_key"]],
+                    images_dir=images_dir_v,
+                    temp_dir=temp_dir,
+                )
+                final_pptx_files[deck_plan["pptx_output_key"]] = deck_path
+                validate_portrait_images(
+                    images_dir_v,
+                    expected_pages=deck_plan["expected_pages"],
+                    deck_label=deck_plan["task_name"],
+                    page_numbers=page_numbers,
+                )
+
         # 竖版页数校验
         all_images_v = sorted(images_dir_v.glob("P*.png"), key=lambda x: int(x.stem[1:]))
         if len(all_images_v) != pages:
