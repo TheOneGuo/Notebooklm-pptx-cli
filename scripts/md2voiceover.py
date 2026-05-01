@@ -130,15 +130,7 @@ class MiMoScriptGenerator:
 
     def _default_plan(self, page_count: int) -> Dict:
         """JSON解析失败时的默认视频分配"""
-        ppv = page_count // 3
-        return {
-            "report_title": "行业研究报告",
-            "videos": [
-                {"title": "行业格局与技术突破", "pages": f"1-{ppv}", "theme": "行业概况", "hook": "数据冲击"},
-                {"title": "产业链核心标的", "pages": f"{ppv+1}-{ppv*2}", "theme": "公司分析", "hook": "龙头对比"},
-                {"title": "投资策略与风险", "pages": f"{ppv*2+1}-{page_count}", "theme": "投资建议", "hook": "收益测算"},
-            ]
-        }
+        return build_default_video_plan(page_count)
 
     def generate_page_script(self, md_content: str, page_text: str,
                              page_num: int, total_pages: int,
@@ -261,6 +253,57 @@ class MiMoScriptGenerator:
 import re
 
 
+def build_default_video_plan(page_count: int) -> Dict:
+    """生成默认视频规划，避免在规范化阶段依赖外部 API 客户端。"""
+    ppv = page_count // 3
+    return {
+        "report_title": "行业研究报告",
+        "videos": [
+            {"title": "行业格局与技术突破", "pages": f"1-{ppv}", "theme": "行业概况", "hook": "数据冲击"},
+            {"title": "产业链核心标的", "pages": f"{ppv+1}-{ppv*2}", "theme": "公司分析", "hook": "龙头对比"},
+            {"title": "投资策略与风险", "pages": f"{ppv*2+1}-{page_count}", "theme": "投资建议", "hook": "收益测算"},
+        ]
+    }
+
+
+
+def normalize_video_plan(plan: Dict, page_count: int) -> Dict:
+    """标准化视频规划字段，兼容 hook/钩子 等变体，并补齐默认值。"""
+    normalized = {
+        "report_title": plan.get("report_title", "行业研究报告"),
+        "videos": [],
+    }
+
+    fallback = build_default_video_plan(page_count)["videos"]
+    source_videos = plan.get("videos") or []
+
+    for idx, default_video in enumerate(fallback):
+        raw = source_videos[idx] if idx < len(source_videos) and isinstance(source_videos[idx], dict) else {}
+        title = raw.get("title") or default_video["title"]
+        pages = raw.get("pages") or default_video["pages"]
+        theme = raw.get("theme") or raw.get("主题") or default_video["theme"]
+        hook = (
+            raw.get("hook")
+            or raw.get("钩子")
+            or raw.get("hook_idea")
+            or raw.get("开场钩子")
+            or theme
+            or default_video["hook"]
+        )
+
+        normalized["videos"].append(
+            {
+                **raw,
+                "title": title,
+                "pages": pages,
+                "theme": theme,
+                "hook": hook,
+            }
+        )
+
+    return normalized
+
+
 def split_md_by_pages(md_content: str, page_count: int) -> List[str]:
     """将 MD 内容按页数均匀切分"""
     # 先尝试按 ## 标题切分
@@ -319,6 +362,7 @@ def generate_all_scripts(md_path: Path, images_dir: Path, output_dir: Path):
     # ── Phase 1: 视频规划 ──
     print("\n📊 [Phase 1] 分析报告内容，规划视频分配...")
     plan = gen.analyze_md_for_videos(md_content, page_count)
+    plan = normalize_video_plan(plan, page_count)
     report_title = plan["report_title"]
     videos = plan["videos"]
 

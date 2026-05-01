@@ -29,6 +29,23 @@ def write_mono_wav(path: Path, seconds: float = 1.0, sample_rate: int = 16000):
             wav_file.writeframes(struct.pack("<h", sample))
 
 
+def test_normalize_video_plan_accepts_chinese_hook_key():
+    plan = {
+        "report_title": "测试报告",
+        "videos": [
+            {"title": "V1", "pages": "1-2", "theme": "主题1", "钩子": "钩子1"},
+            {"title": "V2", "pages": "3-4", "theme": "主题2", "hook": "钩子2"},
+            {"title": "V3", "pages": "5-6", "theme": "主题3"},
+        ],
+    }
+
+    normalized = md2voiceover.normalize_video_plan(plan, page_count=6)
+
+    assert normalized["report_title"] == "测试报告"
+    assert [video["hook"] for video in normalized["videos"]] == ["钩子1", "钩子2", "主题3"]
+    assert [video["pages"] for video in normalized["videos"]] == ["1-2", "3-4", "5-6"]
+
+
 def test_speed_up_audio_outputs_stereo_wav(tmp_path):
     input_wav = tmp_path / "input.wav"
     output_wav = tmp_path / "output.wav"
@@ -44,3 +61,49 @@ def test_speed_up_audio_outputs_stereo_wav(tmp_path):
         processed_duration = processed.getnframes() / processed.getframerate()
         assert processed.getnchannels() == 2
         assert processed_duration < original_duration
+
+
+def test_generate_all_scripts_accepts_chinese_hook_key(tmp_path, monkeypatch):
+    md_path = tmp_path / "report.md"
+    md_path.write_text("# 测试报告\n\n第一部分\n\n第二部分\n\n第三部分")
+
+    images_dir = tmp_path / "images_landscape"
+    images_dir.mkdir()
+    for i in range(1, 4):
+        (images_dir / f"P{i}.png").write_bytes(b"png")
+
+    output_dir = tmp_path / "voiceover"
+
+    class FakeGenerator:
+        def analyze_md_for_videos(self, md_content, page_count):
+            assert page_count == 3
+            return {
+                "report_title": "测试报告",
+                "videos": [
+                    {"title": "视频1", "pages": "1-1", "theme": "主题1", "钩子": "钩子1"},
+                    {"title": "视频2", "pages": "2-2", "theme": "主题2", "钩子": "钩子2"},
+                    {"title": "视频3", "pages": "3-3", "theme": "主题3", "钩子": "钩子3"},
+                ],
+            }
+
+        def generate_page_script(self, md_content, page_text, page_num, total_pages, video_info, prev_ending=""):
+            return f"[PAGE:{page_num}]\\n口播{page_num}"
+
+        def generate_video_opening(self, video_title, video_theme, hook_idea, video_num, prev_video_ending=""):
+            return f"开场{video_num}:{hook_idea}"
+
+        def generate_video_ending(self, video_title, video_theme, video_num, is_last=False, next_video_title=""):
+            return f"结尾{video_num}"
+
+        def generate_combined_intro(self, report_title, video_titles):
+            return "合集开场"
+
+    monkeypatch.setattr(md2voiceover, "MiMoScriptGenerator", FakeGenerator)
+
+    scripts = md2voiceover.generate_all_scripts(md_path, images_dir, output_dir)
+
+    assert scripts["V1-开场.txt"] == "开场1:钩子1"
+    assert scripts["V2-开场.txt"] == "开场2:钩子2"
+    assert scripts["V3-开场.txt"] == "开场3:钩子3"
+    assert (output_dir / "合集-开场.txt").read_text() == "合集开场"
+    assert len(list(output_dir.glob("*.txt"))) == 11
