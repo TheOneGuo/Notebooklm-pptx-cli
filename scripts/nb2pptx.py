@@ -225,6 +225,8 @@ def extract_images_from_pptx(pptx_path: Path, output_dir: Path) -> List[Path]:
     import zipfile
     import re
     import xml.etree.ElementTree as ET
+
+    output_dir.mkdir(parents=True, exist_ok=True)
     
     NS = {
         'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
@@ -335,6 +337,31 @@ def save_final_pptx_files(raw_pptx_paths: Dict[str, Path], output_dir: Path, not
         saved_paths[key] = dst
 
     return saved_paths
+
+
+def copy_images_with_expected_count(
+    extracted_images: List[Path],
+    output_dir: Path,
+    start_page: int,
+    expected_count: int,
+    deck_label: str,
+) -> Tuple[List[Path], List[str]]:
+    """按预期页数复制图片；若生成过多则仅保留前 expected_count 页并给出警告。"""
+    actual_count = len(extracted_images)
+    if actual_count < expected_count:
+        raise RuntimeError(f"{deck_label} 图片数 {actual_count} < 预期 {expected_count}，丢页中止")
+
+    warnings = []
+    if actual_count > expected_count:
+        warnings.append(f"{deck_label} 图片数 {actual_count} > 预期 {expected_count}，仅保留前 {expected_count} 页")
+
+    output_paths = []
+    for idx, src in enumerate(extracted_images[:expected_count], start=start_page):
+        dst = output_dir / f"P{idx}.png"
+        shutil.copy2(src, dst)
+        output_paths.append(dst)
+
+    return output_paths, warnings
 
 # ═══════════════════════════════════════════════════════════════════════
 # Logo 遮盖工具
@@ -1015,21 +1042,35 @@ def main(
         print("\n   📐 处理横版 PPT（16:9）...")
         images_dir_h = final_output_dir / "images_landscape"
         images_dir_h.mkdir(exist_ok=True)
+        landscape_warnings = []
         
         print("      → 提取 PPT 1（横版前半）图片...")
-        images_h1 = extract_images_from_pptx(pptx_h1, images_dir_h)
+        images_h1 = extract_images_from_pptx(pptx_h1, temp_dir / "images_h1")
         print(f"      ✅ 提取 {len(images_h1)} 张")
+        copied_h1, warnings_h1 = copy_images_with_expected_count(
+            images_h1,
+            images_dir_h,
+            start_page=1,
+            expected_count=pages_per_deck,
+            deck_label="横版前半",
+        )
+        landscape_warnings.extend(warnings_h1)
         
         print("      → 提取 PPT 2（横版后半）图片...")
         temp_dir_h2 = temp_dir / "images_h2"
         temp_dir_h2.mkdir(exist_ok=True)
         images_h2 = extract_images_from_pptx(pptx_h2, temp_dir_h2)
-        
-        # 重命名并移动（接在 h1 后面）
-        for img in images_h2:
-            new_name = f"P{len(images_h1) + int(img.stem[1:])}.png"
-            img.rename(images_dir_h / new_name)
         print(f"      ✅ 提取 {len(images_h2)} 张")
+        copied_h2, warnings_h2 = copy_images_with_expected_count(
+            images_h2,
+            images_dir_h,
+            start_page=pages_per_deck + 1,
+            expected_count=pages - pages_per_deck,
+            deck_label="横版后半",
+        )
+        landscape_warnings.extend(warnings_h2)
+        for warning in warnings_h1 + warnings_h2:
+            print(f"      ⚠️ {warning}")
         
         # 横版页数校验
         all_images_h = sorted(images_dir_h.glob("P*.png"), key=lambda x: int(x.stem[1:]))
@@ -1049,21 +1090,35 @@ def main(
         print("\n   📱 处理竖版 PPT（9:16）...")
         images_dir_v = final_output_dir / "images_portrait"
         images_dir_v.mkdir(exist_ok=True)
+        portrait_warnings = []
         
         print("      → 提取 PPT 3（竖版前半）图片...")
-        images_v1 = extract_images_from_pptx(pptx_v1, images_dir_v)
+        images_v1 = extract_images_from_pptx(pptx_v1, temp_dir / "images_v1")
         print(f"      ✅ 提取 {len(images_v1)} 张")
+        copied_v1, warnings_v1 = copy_images_with_expected_count(
+            images_v1,
+            images_dir_v,
+            start_page=1,
+            expected_count=pages_per_deck,
+            deck_label="竖版前半",
+        )
+        portrait_warnings.extend(warnings_v1)
         
         print("      → 提取 PPT 4（竖版后半）图片...")
         temp_dir_v2 = temp_dir / "images_v2"
         temp_dir_v2.mkdir(exist_ok=True)
         images_v2 = extract_images_from_pptx(pptx_v2, temp_dir_v2)
-        
-        # 重命名并移动（接在 v1 后面）
-        for img in images_v2:
-            new_name = f"P{len(images_v1) + int(img.stem[1:])}.png"
-            img.rename(images_dir_v / new_name)
         print(f"      ✅ 提取 {len(images_v2)} 张")
+        copied_v2, warnings_v2 = copy_images_with_expected_count(
+            images_v2,
+            images_dir_v,
+            start_page=pages_per_deck + 1,
+            expected_count=pages - pages_per_deck,
+            deck_label="竖版后半",
+        )
+        portrait_warnings.extend(warnings_v2)
+        for warning in warnings_v1 + warnings_v2:
+            print(f"      ⚠️ {warning}")
         
         # 竖版页数校验
         all_images_v = sorted(images_dir_v.glob("P*.png"), key=lambda x: int(x.stem[1:]))
@@ -1100,7 +1155,7 @@ def main(
         # ─── 页数校验 ───────────────────────────────────────────────────
         h_count = len(all_images_h)
         v_count = len(all_images_v)
-        warnings = []
+        warnings = landscape_warnings + portrait_warnings
         for w in warnings:
             print(f"   ⚠️ {w}")
 
