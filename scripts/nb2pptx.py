@@ -197,69 +197,6 @@ class NotebookLM:
         ], timeout=30)
         return result.get("task_id")
     
-    def wait_for_artifact(
-        self, 
-        task_id: str, 
-        notebook_id: str,
-        initial_interval: int = 540,
-        max_interval: int = 60,
-        timeout: int = 900
-    ) -> bool:
-        """等待 artifact 生成完成（手动轮询，避免 artifact wait 超时）"""
-        print(f"⏳ 等待生成完成（初始静默{initial_interval}s，后续每{max_interval}s轮询）...")
-        
-        # 状态码映射
-        STATUS_MAP = {0: "pending", 1: "processing", 2: "ready", 3: "completed", 4: "failed"}
-        
-        start_time = time.time()
-        
-        # 初始静默等待
-        if initial_interval > 0:
-            print(f"   → 初始静默等待 {initial_interval}s...")
-            time.sleep(initial_interval)
-        
-        # 轮询
-        while True:
-            elapsed = time.time() - start_time
-            if elapsed > timeout:
-                print(f"❌ 超时（{timeout}s）")
-                return False
-            
-            # 查询 artifact 列表
-            try:
-                result = self.run([
-                    "artifact", "list",
-                    "-n", notebook_id,
-                    "--json"
-                ], timeout=30)
-                
-                artifacts = result.get("artifacts", [])
-                target = None
-                for a in artifacts:
-                    if a.get("id") == task_id or a.get("task_id") == task_id:
-                        target = a
-                        break
-                
-                if target:
-                    status_code = target.get("status", 0)
-                    status_str = STATUS_MAP.get(status_code, f"unknown({status_code})")
-                    print(f"   → 状态: {status_str} (已等待 {int(elapsed)}s)")
-                    
-                    if status_code == 3:  # completed
-                        print("✅ 生成完成！")
-                        return True
-                    elif status_code == 4:  # failed
-                        print(f"❌ 生成失败")
-                        return False
-                else:
-                    print(f"   → 未找到 artifact，继续等待...")
-                    
-            except Exception as e:
-                print(f"   ⚠️ 查询失败: {e}")
-            
-            # 等待下一轮
-            time.sleep(max_interval)
-    
     def download_slides(
         self, 
         output_path: Path, 
@@ -419,58 +356,6 @@ def create_pptx_from_images(images: List[Path], output_path: Path, orientation: 
     prs.save(str(output_path))
     print(f"✅ PPTX 创建完成: {output_path} ({orientation})")
 
-def merge_pptx_files(pptx1_path: Path, pptx2_path: Path, output_path: Path, notebook_title: str) -> None:
-    """
-    合并两个 PPTX 文件：在 ppt1 后增加空白页 + 粘贴 ppt2 的图片
-    
-    参数：
-        pptx1_path: PPT1 文件路径
-        pptx2_path: PPT2 文件路径
-        output_path: 输出文件路径
-        notebook_title: 笔记本名称（用于输出文件名）
-    """
-    try:
-        from pptx import Presentation
-        from pptx.util import Inches
-    except ImportError:
-        print("❌ 需要安装 python-pptx: pip install python-pptx")
-        sys.exit(1)
-    
-    print("   → 打开 PPT 1...")
-    prs1 = Presentation(str(pptx1_path))
-    slide_width = prs1.slide_width
-    slide_height = prs1.slide_height
-    blank_layout = prs1.slide_layouts[6]  # 空白布局
-    
-    print(f"   → PPT 1 原有 {len(prs1.slides)} 页")
-    
-    # 提取 ppt2 的图片
-    temp_dir = pptx2_path.parent / "temp_ppt2_images"
-    temp_dir.mkdir(exist_ok=True)
-    print("   → 提取 PPT 2 的图片...")
-    images_ppt2 = extract_images_from_pptx(pptx2_path, temp_dir)
-    print(f"   ✅ 提取 {len(images_ppt2)} 张图片")
-    
-    # 在 ppt1 后增加空白页并粘贴图片
-    print("   → 在 PPT 1 后增加页面并粘贴图片...")
-    for i, img_path in enumerate(sorted(images_ppt2, key=lambda x: int(x.stem[1:])), 1):
-        slide = prs1.slides.add_slide(blank_layout)
-        # 添加图片，占满整张幻灯片
-        slide.shapes.add_picture(
-            str(img_path),
-            Inches(0), Inches(0),
-            width=slide_width,
-            height=slide_height
-        )
-        print(f"   ✓ 第{len(prs1.slides)}页: {img_path.name}")
-    
-    # 保存合并后的 PPTX
-    prs1.save(str(output_path))
-    print(f"✅ PPTX 合并完成: {output_path} (共 {len(prs1.slides)} 页)")
-    
-    # 清理临时图片
-    shutil.rmtree(temp_dir)
-
 # ═══════════════════════════════════════════════════════════════════════
 # Logo 遮盖工具
 # ═══════════════════════════════════════════════════════════════════════
@@ -545,6 +430,20 @@ def cover_logo_on_images(
 # 主流程
 # ═══════════════════════════════════════════════════════════════════════
 
+def check_dependencies() -> List[str]:
+    """检查运行依赖，返回缺失项列表"""
+    missing = []
+    try:
+        import python_pptx  # noqa: F401
+    except ImportError:
+        missing.append("python-pptx (pip install python-pptx)")
+    try:
+        from PIL import Image  # noqa: F401
+    except ImportError:
+        missing.append("Pillow (pip install Pillow)")
+    return missing
+
+
 def main(
     md_file: Path,
     title: Optional[str] = None,
@@ -557,18 +456,35 @@ def main(
     """
     完整流水线：MD → NotebookLM → PPTX → 图片 → Logo 遮盖
     """
+    # ─── 前置检查 ────────────────────────────────────────────────────
+    missing = check_dependencies()
+    if missing:
+        print("❌ 缺少运行依赖:")
+        for m in missing:
+            print(f"   - {m}")
+        sys.exit(1)
+
+    if md_file.stat().st_size == 0:
+        print(f"❌ 输入文件为空: {md_file}")
+        sys.exit(1)
+
     # 参数处理
     title = title or md_file.stem
     logo_path = logo_path or DEFAULT_LOGO_PATH
     wait_config = wait_config or DEFAULT_WAIT_CONFIG
-    
+
+    if not logo_path.exists():
+        print(f"⚠️ Logo 文件不存在: {logo_path}，将跳过 Logo 遮盖")
+        logo_path = None
+
     print("="*60)
-    print(f"📄 输入文件: {md_file}")
+    print(f"📄 输入文件: {md_file} ({md_file.stat().st_size} bytes)")
     print(f"📝 初始标题: {title}")
     print(f"📊 目标页数: {pages}")
-    print(f"🎨 Logo: {logo_path}")
+    print(f"🎨 Logo: {logo_path or '(跳过)'}")
+    print(f"📁 输出目录: {output_dir or '默认'}")
     print("="*60)
-    
+
     # 初始化
     cli_path = find_notebooklm_cli()
     nb = NotebookLM(cli_path)
@@ -576,16 +492,35 @@ def main(
     notebook_id = None
     temp_dir = None
     notebook_title = title  # 初始化为 title，后续会被步骤3重命名
+    run_id = time.strftime("%Y%m%d_%H%M%S")
+    run_start = time.time()
+    step_times = []  # [(step_name, elapsed_sec)]
+
+    def step_timer(step_name: str):
+        """记录上一步耗时并开始新步骤"""
+        elapsed = time.time() - run_start
+        if step_times:
+            prev_name, prev_start = step_times[-1]
+            step_elapsed = elapsed - prev_start
+            step_times[-1] = (prev_name, step_elapsed)
+        step_times.append((step_name, elapsed))
+        return elapsed
     
     try:
         # ─── Step 1: 创建笔记本 ───────────────────────────────────────
+        step_timer("1.创建笔记本")
         print("\n[1/10] 创建 NotebookLM 笔记本...")
         notebook_id = nb.create_notebook(title)
+        if not notebook_id:
+            raise RuntimeError("创建笔记本失败：返回空 ID")
         print(f"   ✅ 笔记本 ID: {notebook_id}")
-        
+
         # ─── Step 2: 上传 MD 作为来源并重命名为 a ────────────────────
+        step_timer("2.上传来源")
         print("\n[2/10] 上传 MD 文件作为来源...")
         source_a_id, source_a_title = nb.add_source_file(md_file, notebook_id)
+        if not source_a_id:
+            raise RuntimeError("上传来源失败：返回空 source ID")
         print(f"   ✅ 来源上传成功: {source_a_title} ({source_a_id})")
         
         # 重命名为 a
@@ -594,6 +529,7 @@ def main(
         print(f"   ✅ 来源 A: a ({source_a_id})")
         
         # ─── Step 3: 从来源提取关键信息并重命名笔记本 ──────────────────
+        step_timer("3.提取主题")
         print("\n[3/10] 从来源提取关键信息并重命名笔记本...")
         extract_prompt = '请从来源 a 中提取报告的核心主题，用一句话概括（不超过20字），仅返回主题名称，不要任何其他内容。不要添加"answer:"前缀。'
         result = nb.run([
@@ -617,6 +553,7 @@ def main(
         print(f"   ✅ 笔记本重命名为: {notebook_title}")
         
         # ─── Step 4: 自动生成 PPT 大纲（带风格要求）────────────────────
+        step_timer("4.生成大纲")
         print("\n[4/10] 自动生成 PPT 大纲（带风格要求）...")
         
         # 构建提示词（包含详细的风格要求，强制中文）
@@ -660,18 +597,24 @@ def main(
         print(f"   ✅ 笔记 ID: {note_id}")
         
         # ─── Step 5: 笔记转为来源 ───────────────────────────────────
+        step_timer("5.笔记转来源")
         print("\n[5/10] 将大纲笔记转为来源 B...")
         # 获取笔记内容
         note_content = nb.get_note_content(note_id, notebook_id)
+        if not note_content or len(note_content.strip()) < 50:
+            raise RuntimeError(f"笔记内容为空或过短（{len(note_content)} 字符），无法生成 PPT")
         print(f"   📝 笔记内容: {len(note_content)} 字符")
-        
+
         # 添加为来源
         source_b_id = nb.add_source_text(note_content, notebook_id, note_title)
+        if not source_b_id:
+            raise RuntimeError("添加来源 B 失败：返回空 source ID")
         # 重命名为 b
         nb.rename_source(source_b_id, notebook_id, "b")
         print(f"   ✅ 来源 B: {source_b_id}")
         
         # ─── Step 6: 并行生成 PPT（横版 PPT1/PPT2 + 竖版 PPT3/PPT4）──────────────────────
+        step_timer("6.并行生成PPT")
         print("\n[6/10] 并行生成 PPT（横版+竖版）...")
         pages_per_deck = pages // 2
         
@@ -682,63 +625,36 @@ def main(
         print(f"   → 已有 {len(initial_artifacts)} 个 artifacts")
         
         # ═══════════════════════════════════════════════════════════════════
-        # 横版 PPT 提示词（PPT1 + PPT2）
+        # PPT 提示词（公共模板 + 4 个任务）
         # ═══════════════════════════════════════════════════════════════════
-        
-        # PPT 1 提示词（横版前半部分）
-        ppt1_prompt = f'''[LANGUAGE: CHINESE ONLY - 禁止使用任何英文]
 
-根据来源a的分析内容，按照来源b的大纲制作PPT。这份PPT总共包含{pages}页。
+        def build_ppt_prompt(orientation: str, page_start: int, page_end: int, is_first_half: bool) -> str:
+            """构建 PPT 生成提示词
 
-【强制语言要求】
-- 所有页面必须100%使用中文
-- 标题、正文、图表标签、页脚、按钮文字必须全部是中文
-- 严禁出现任何英文单词或字母
-- 如果必须使用专有名词，请用中文翻译
+            Args:
+                orientation: "landscape" (横版16:9) 或 "portrait" (竖版9:16)
+                page_start: 起始页码
+                page_end: 结束页码
+                is_first_half: 是否为前半段（影响"先制作"vs"制作"措辞）
+            """
+            if orientation == "landscape":
+                layout_rule = "横版（16:9）。页面宽度大于高度，适合PC端展示和宽屏投影。"
+                label = "横版"
+            else:
+                layout_rule = (
+                    "必须严格使用竖版（9:16）纵向布局。页面高度明显大于宽度（高宽比约为1.77:1），"
+                    "适合手机端短视频展示。所有内容必须纵向排列：大标题在页面上方，正文和图表垂直向下展开，"
+                    "左右留白对称，充分利用竖向空间。严禁使用横版布局。"
+                )
+                label = "竖版"
 
-【版式要求】横版（16:9）。页面宽度大于高度，适合PC端展示和宽屏投影。
+            content_verb = "先制作" if is_first_half else "制作"
+            style_ref = "来源b的大纲" if is_first_half else "来源b里的大纲"
+            consistency = "" if is_first_half else f"，要求和前{page_start - 1}页保持完全一致的风格和语言"
 
-【风格要求】采用高端商务黑金/暗黑机械风格。背景使用深邃黑与暗灰色渐变，营造沉浸式暗室感。主体图表（如结构图、流程图）必须呈现 3D 拟物化的哑光红铜/古铜金属材质，避免亮金色。图表边缘需带有亮金色流光特效。整体画面需传达出极度沉稳、权威、严谨与精密的质感。
+            return f'''[LANGUAGE: CHINESE ONLY - 禁止使用任何英文]
 
-【免责声明】所有页面底部必须显示以下文字（分两行）：
-市场有风险，决策需独立；
-股市有风险，入市需谨慎。
-
-【内容要求】要求插图丰富，确保每个中文字不要出错，字体清晰。研报中提到的所有公司名称、股票代码、核心数据必须在PPT中明确体现，不得遗漏。先制作来源b要求的第1-{pages_per_deck}页。
-
-【PPT标识】这是横版PPT1，包含第1-{pages_per_deck}页。'''
-
-        # PPT 2 提示词（横版后半部分）
-        ppt2_prompt = f'''[LANGUAGE: CHINESE ONLY - 禁止使用任何英文]
-
-根据来源a的分析内容，按照来源b里的大纲制作PPT。这份PPT总共包含{pages}页。
-
-【强制语言要求】
-- 所有页面必须100%使用中文
-- 标题、正文、图表标签、页脚、按钮文字必须全部是中文
-- 严禁出现任何英文单词或字母
-- 如果必须使用专有名词，请用中文翻译
-
-【版式要求】横版（16:9）。页面宽度大于高度，适合PC端展示和宽屏投影。
-
-【风格要求】采用高端商务黑金/暗黑机械风格。背景使用深邃黑与暗灰色渐变，营造沉浸式暗室感。主体图表（如结构图、流程图）必须呈现 3D 拟物化的哑光红铜/古铜金属材质，避免亮金色。图表边缘需带有亮金色流光特效。整体画面需传达出极度沉稳、权威、严谨与精密的质感。
-
-【免责声明】所有页面底部必须显示以下文字（分两行）：
-市场有风险，决策需独立；
-股市有风险，入市需谨慎。
-
-【内容要求】要求插图丰富，确保每个中文字不要出错，字体清晰。研报中提到的所有公司名称、股票代码、核心数据必须在PPT中明确体现，不得遗漏。制作来源b要求的第{pages_per_deck+1}-{pages}页，要求和前{pages_per_deck}页保持完全一致的风格和语言。
-
-【PPT标识】这是横版PPT2，包含第{pages_per_deck+1}-{pages}页。'''
-
-        # ═══════════════════════════════════════════════════════════════════
-        # 竖版 PPT 提示词（PPT3 + PPT4）
-        # ═══════════════════════════════════════════════════════════════════
-        
-        # PPT 3 提示词（竖版前半部分）
-        ppt3_prompt = f'''[LANGUAGE: CHINESE ONLY - 禁止使用任何英文]
-
-根据来源a的分析内容，按照来源b的大纲制作PPT。这份PPT总共包含{pages}页。
+根据来源a的分析内容，按照{style_ref}制作PPT。这份PPT总共包含{pages}页。
 
 【强制语言要求】
 - 所有页面必须100%使用中文
@@ -746,7 +662,7 @@ def main(
 - 严禁出现任何英文单词或字母
 - 如果必须使用专有名词，请用中文翻译
 
-【版式要求】必须严格使用竖版（9:16）纵向布局。页面高度明显大于宽度（高宽比约为1.77:1），适合手机端短视频展示。所有内容必须纵向排列：大标题在页面上方，正文和图表垂直向下展开，左右留白对称，充分利用竖向空间。严禁使用横版布局。
+【版式要求】{layout_rule}
 
 【风格要求】采用高端商务黑金/暗黑机械风格。背景使用深邃黑与暗灰色渐变，营造沉浸式暗室感。主体图表（如结构图、流程图）必须呈现 3D 拟物化的哑光红铜/古铜金属材质，避免亮金色。图表边缘需带有亮金色流光特效。整体画面需传达出极度沉稳、权威、严谨与精密的质感。
 
@@ -754,32 +670,15 @@ def main(
 市场有风险，决策需独立；
 股市有风险，入市需谨慎。
 
-【内容要求】要求插图丰富，确保每个中文字不要出错，字体清晰。研报中提到的所有公司名称、股票代码、核心数据必须在PPT中明确体现，不得遗漏。先制作来源b要求的第1-{pages_per_deck}页。
+【内容要求】要求插图丰富，确保每个中文字不要出错，字体清晰。研报中提到的所有公司名称、股票代码、核心数据必须在PPT中明确体现，不得遗漏。{content_verb}来源b要求的第{page_start}-{page_end}页{consistency}。
 
-【PPT标识】这是竖版PPT3，包含第1-{pages_per_deck}页。'''
+【PPT标识】这是{label}PPT，包含第{page_start}-{page_end}页。'''
 
-        # PPT 4 提示词（竖版后半部分）
-        ppt4_prompt = f'''[LANGUAGE: CHINESE ONLY - 禁止使用任何英文]
-
-根据来源a的分析内容，按照来源b里的大纲制作PPT。这份PPT总共包含{pages}页。
-
-【强制语言要求】
-- 所有页面必须100%使用中文
-- 标题、正文、图表标签、页脚、按钮文字必须全部是中文
-- 严禁出现任何英文单词或字母
-- 如果必须使用专有名词，请用中文翻译
-
-【版式要求】必须严格使用竖版（9:16）纵向布局。页面高度明显大于宽度（高宽比约为1.77:1），适合手机端短视频展示。所有内容必须纵向排列：大标题在页面上方，正文和图表垂直向下展开，左右留白对称，充分利用竖向空间。严禁使用横版布局。
-
-【风格要求】采用高端商务黑金/暗黑机械风格。背景使用深邃黑与暗灰色渐变，营造沉浸式暗室感。主体图表（如结构图、流程图）必须呈现 3D 拟物化的哑光红铜/古铜金属材质，避免亮金色。图表边缘需带有亮金色流光特效。整体画面需传达出极度沉稳、权威、严谨与精密的质感。
-
-【免责声明】所有页面底部必须显示以下文字（分两行）：
-市场有风险，决策需独立；
-股市有风险，入市需谨慎。
-
-【内容要求】要求插图丰富，确保每个中文字不要出错，字体清晰。研报中提到的所有公司名称、股票代码、核心数据必须在PPT中明确体现，不得遗漏。制作来源b要求的第{pages_per_deck+1}-{pages}页，要求和前{pages_per_deck}页保持完全一致的风格和语言。
-
-【PPT标识】这是竖版PPT4，包含第{pages_per_deck+1}-{pages}页。'''
+        # 4 个 PPT 任务
+        ppt1_prompt = build_ppt_prompt("landscape", 1, pages_per_deck, is_first_half=True)
+        ppt2_prompt = build_ppt_prompt("landscape", pages_per_deck + 1, pages, is_first_half=False)
+        ppt3_prompt = build_ppt_prompt("portrait", 1, pages_per_deck, is_first_half=True)
+        ppt4_prompt = build_ppt_prompt("portrait", pages_per_deck + 1, pages, is_first_half=False)
 
         # ═══════════════════════════════════════════════════════════════════
         # 并行提交 4 个生成任务
@@ -937,6 +836,7 @@ def main(
         print(f"   ✅ PPT 4（竖版后半）: {ppt4_artifact_id}")
         
         # ─── Step 7: 下载 PPT ─────────────────────────────────────
+        step_timer("7.下载PPT")
         print("\n[7/10] 下载 PPT...")
         
         # 创建临时目录
@@ -985,10 +885,11 @@ def main(
         pptx_v2 = download_with_fallback("PPT 4（竖版后半）", ppt4_artifact_id, "ppt_v2.pptx", excluded_ids)
         
         # ─── Step 8: 合并 PPTX（横版 + 竖版分别合并）─────────────────
+        step_timer("8.合并+图片")
         print("\n[8/10] 合并 PPTX 并提取图片...")
         
-        # 创建输出目录：/Users/gray/Documents/A股研报/<笔记本名称>/
-        final_output_dir = DEFAULT_OUTPUT_DIR / notebook_title
+        # 创建输出目录（尊重 --output-dir 参数）
+        final_output_dir = output_dir if output_dir else DEFAULT_OUTPUT_DIR / notebook_title
         final_output_dir.mkdir(parents=True, exist_ok=True)
         print(f"   📁 输出目录: {final_output_dir}")
         
@@ -1012,8 +913,17 @@ def main(
             img.rename(images_dir_h / new_name)
         print(f"      ✅ 提取 {len(images_h2)} 张")
         
-        # 创建横版合并 PPTX
+        # 横版页数校验
         all_images_h = sorted(images_dir_h.glob("P*.png"), key=lambda x: int(x.stem[1:]))
+        if len(all_images_h) != pages:
+            print(f"   ⚠️ 横版图片数 {len(all_images_h)} ≠ 预期 {pages}，可能丢页")
+        if logo_path:
+            print("      → 遮盖横版 NotebookLM Logo...")
+            cover_h = cover_logo_on_images(images_dir_h, logo_path)
+            if cover_h != len(all_images_h):
+                print(f"   ⚠️ 横版部分图片遮盖失败: {cover_h}/{len(all_images_h)}")
+        else:
+            print("      ⏭️ 跳过 Logo 遮盖（Logo 文件不存在）")
         final_pptx_h = final_output_dir / f"{notebook_title}_横版.pptx"
         create_pptx_from_images(all_images_h, final_pptx_h, orientation="landscape")
         
@@ -1037,21 +947,22 @@ def main(
             img.rename(images_dir_v / new_name)
         print(f"      ✅ 提取 {len(images_v2)} 张")
         
-        # 创建竖版合并 PPTX
+        # 竖版页数校验
         all_images_v = sorted(images_dir_v.glob("P*.png"), key=lambda x: int(x.stem[1:]))
+        if len(all_images_v) != pages:
+            print(f"   ⚠️ 竖版图片数 {len(all_images_v)} ≠ 预期 {pages}，可能丢页")
+        if logo_path:
+            print("      → 遮盖竖版 NotebookLM Logo...")
+            cover_v = cover_logo_on_images(images_dir_v, logo_path)
+            if cover_v != len(all_images_v):
+                print(f"   ⚠️ 竖版部分图片遮盖失败: {cover_v}/{len(all_images_v)}")
+        else:
+            print("      ⏭️ 跳过 Logo 遮盖（Logo 文件不存在）")
         final_pptx_v = final_output_dir / f"{notebook_title}_竖版.pptx"
         create_pptx_from_images(all_images_v, final_pptx_v, orientation="portrait")
         
-        # ─── Step 9: Logo 遮盖 ──────────────────────────────────────
-        print("\n[9/10] 遮盖 NotebookLM logo...")
-        
-        cover_h = cover_logo_on_images(images_dir_h, logo_path)
-        if cover_h != len(all_images_h):
-            print(f"   ⚠️ 横版部分图片遮盖失败: {cover_h}/{len(all_images_h)}")
-        
-        cover_v = cover_logo_on_images(images_dir_v, logo_path)
-        if cover_v != len(all_images_v):
-            print(f"   ⚠️ 竖版部分图片遮盖失败: {cover_v}/{len(all_images_v)}")
+        # ─── Step 9: Logo 遮盖（已在 Step 8 中完成）────────────────────
+        print("\n[9/10] Logo 遮盖已完成（合并前执行）")
         
         # ─── Step 10: 清理 ──────────────────────────────────────────
         print("\n[10/10] 清理临时文件...")
@@ -1068,24 +979,58 @@ def main(
             except Exception as e:
                 print(f"   ⚠️ 删除笔记本失败: {e}")
         
+        # ─── 页数校验 ───────────────────────────────────────────────────
+        h_count = len(all_images_h)
+        v_count = len(all_images_v)
+        warnings = []
+        if h_count != pages:
+            warnings.append(f"横版页数 {h_count} ≠ 预期 {pages}")
+        if v_count != pages:
+            warnings.append(f"竖版页数 {v_count} ≠ 预期 {pages}")
+        if h_count == 0:
+            warnings.append("横版无图片")
+        if v_count == 0:
+            warnings.append("竖版无图片")
+        for w in warnings:
+            print(f"   ⚠️ {w}")
+
         # ─── 完成 ───────────────────────────────────────────────────
         print("\n" + "="*60)
-        print("✅ 流水线完成！")
+        print(f"✅ 流水线完成！（耗时 {total_sec:.0f}s，run_id={run_id}）")
         print(f"   📦 横版 PPTX: {final_pptx_h}")
         print(f"   📦 竖版 PPTX: {final_pptx_v}")
-        print(f"   🖼️  横版图片: {images_dir_h} ({len(all_images_h)} 张)")
-        print(f"   🖼️  竖版图片: {images_dir_v} ({len(all_images_v)} 张)")
-        print(f"   📊 总页数: {len(all_images_h)} 横版 + {len(all_images_v)} 竖版")
+        print(f"   🖼️  横版图片: {images_dir_h} ({h_count}/{pages} 张)")
+        print(f"   🖼️  竖版图片: {images_dir_v} ({v_count}/{pages} 张)")
+        if warnings:
+            print(f"   ⚠️ 警告: {len(warnings)} 项")
         print("="*60)
-        
-        return {
+
+        step_timer("done")
+        total_sec = time.time() - run_start
+
+        result = {
+            "status": "ok" if not warnings else "partial",
+            "run_id": run_id,
+            "total_seconds": round(total_sec, 1),
+            "step_times": {name: round(sec, 1) for name, sec in step_times},
             "pptx_landscape": str(final_pptx_h),
             "pptx_portrait": str(final_pptx_v),
             "images_dir_landscape": str(images_dir_h),
             "images_dir_portrait": str(images_dir_v),
-            "page_count_landscape": len(all_images_h),
-            "page_count_portrait": len(all_images_v),
+            "page_count_landscape": h_count,
+            "page_count_portrait": v_count,
+            "expected_pages": pages,
+            "warnings": warnings,
+            "notebook_id": notebook_id,
+            "output_dir": str(final_output_dir),
         }
+
+        # 保存运行结果 JSON
+        result_file = final_output_dir / "run_result.json"
+        result_file.write_text(json.dumps(result, ensure_ascii=False, indent=2))
+        print(f"   📋 运行结果: {result_file}")
+
+        return result
         
     except Exception as e:
         print(f"\n❌ 流水线失败: {e}")

@@ -594,7 +594,7 @@ class ConversationAutomator:
                     if response_text and len(response_text) > 50:
                         time.sleep(3)
                         # 再次确认
-                        _ab(["snapshot"], timeout=10)
+                        result2 = _ab(["snapshot"], timeout=10)
                         if "Stop generating" not in result2.stdout:
                             print(f"  [OK] 回复完成（字数稳定）")
                             return self._extract_latest_response(result2.stdout)
@@ -606,8 +606,8 @@ class ConversationAutomator:
                 time.sleep(5)
 
         print(f"  [!] 等待超时（{self.timeout_per_round}s），尝试提取已有内容")
-        _ab(["snapshot"], timeout=15)
-        return self._extract_latest_response(result.stdout)
+        final_result = _ab(["snapshot"], timeout=15)
+        return self._extract_latest_response(final_result.stdout)
 
     def _extract_latest_response(self, snapshot: str) -> str:
         """从 snapshot 提取最新的 assistant 回复文本"""
