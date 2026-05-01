@@ -20,7 +20,7 @@
 | ⚠️ **免责声明硬保障** | PIL 代码级强制绘制标准股市免责声明（双层保障） |
 | 🌐 **强制中文** | 所有提示词含中文约束，确保 PPT 全中文输出 |
 | 🎙️ **AI 口播稿生成** | 基于 MD 内容自动生成抖音风格口播脚本（MiMo-v2.5-pro） |
-| 🔊 **语音克隆配音** | MiMo VoiceClone TTS 合成 + 1.5 倍速输出 |
+| 🔊 **语音克隆配音** | MiMo VoiceClone TTS 合成 + 1.5 倍速双声道输出 |
 
 ---
 
@@ -108,11 +108,13 @@ Notebooklm-pptx-cli/
 
 ```
 ~/Documents/A股研报/<笔记本名称>/
-├── <笔记本名称>_横版.pptx          # 横版 16:9 PPTX
-├── <笔记本名称>_竖版.pptx          # 竖版 9:16 PPTX
+├── <笔记本名称>_横版_前半.pptx     # NotebookLM 原始横版前半
+├── <笔记本名称>_横版_后半.pptx     # NotebookLM 原始横版后半
+├── <笔记本名称>_竖版_前半.pptx     # NotebookLM 原始竖版前半
+├── <笔记本名称>_竖版_后半.pptx     # NotebookLM 原始竖版后半
 ├── images_landscape/               # 横版图片（P1.png ~ P30.png）
 ├── images_portrait/                # 竖版图片（P1.png ~ P30.png）
-├── run_result.json                 # 运行结果（含耗时、警告等）
+├── run_result.json                 # 运行结果（含耗时、PPT 路径、警告等）
 └── 配音/                           # 口播稿 + 音频（md2voiceover 输出）
     ├── V1-开场.txt
     ├── V1-P1.txt ~ V1-P10.txt
@@ -146,9 +148,9 @@ Step 6  ┌───────────────────────
   ↓
 Step 7  手动轮询等待全部 artifact 完成
   ↓
-Step 8  下载 PPT → 提取图片 → 遮盖 Logo → 绘制免责声明 → 合并为 PPTX
+Step 8  下载 PPT → 保存原始 PPTX → 提取图片 → 遮盖 Logo → 绘制免责声明
   ↓
-Step 9  （Logo 遮盖 + 免责声明已在 Step 8 中完成）
+Step 9  （Logo 遮盖 + 免责声明已在 Step 8 中完成，仅作用于图片）
   ↓
 Step 10 清理临时文件 + 删除 NotebookLM 笔记本
 ```
@@ -164,7 +166,7 @@ Step 10 清理临时文件 + 删除 NotebookLM 笔记本
 2. 调用 MiMo-v2.5-pro 生成视频规划（3 个抖音视频 + 片头片尾）
 3. 逐页生成口播脚本（~60s/页，含抖音钩子 + 换气停顿）
 4. MiMo VoiceClone TTS 合成语音
-5. ffmpeg 1.5 倍速加速
+5. ffmpeg 1.5 倍速 + 双声道处理
 ```
 
 ### 配置

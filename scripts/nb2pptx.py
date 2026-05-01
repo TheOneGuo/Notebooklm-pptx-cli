@@ -19,9 +19,9 @@ NotebookLM MD → PPTX 完整流水线
     4. 生成 PPT 大纲笔记
     5. 笔记转为来源
     6. 并行生成 4 个 PPT（横版PPT1/PPT2 + 竖版PPT3/PPT4）
-    7. 下载并分别合并横版和竖版 PPTX
-    8. 提取图片（images_landscape/ + images_portrait/）
-    9. 遮盖 NotebookLM Logo
+    7. 下载原始 PPTX 文件
+    8. 保存原始 PPTX + 提取图片（images_landscape/ + images_portrait/）
+    9. 遮盖 NotebookLM Logo + 绘制免责声明（仅作用于图片）
     10. 清理临时文件
 """
 
@@ -317,44 +317,24 @@ def extract_images_from_pptx(pptx_path: Path, output_dir: Path) -> List[Path]:
     
     return images
 
-def create_pptx_from_images(images: List[Path], output_path: Path, orientation: str = "landscape") -> None:
-    """从图片创建 PPTX
-    
-    参数:
-        images: 图片路径列表
-        output_path: 输出 PPTX 路径
-        orientation: 方向 - "landscape"(横版 16:9) 或 "portrait"(竖版 9:16)
-    """
-    try:
-        from pptx import Presentation
-        from pptx.util import Inches
-    except ImportError:
-        print("❌ 需要安装 python-pptx: pip install python-pptx")
-        sys.exit(1)
-    
-    prs = Presentation()
-    if orientation == "portrait":
-        prs.slide_width = Inches(7.5)   # 9:16 竖版
-        prs.slide_height = Inches(13.333)
-    else:
-        prs.slide_width = Inches(13.333)  # 16:9 横版
-        prs.slide_height = Inches(7.5)
-    
-    blank_layout = prs.slide_layouts[6]  # 空白布局
-    
-    for i, img_path in enumerate(images, 1):
-        slide = prs.slides.add_slide(blank_layout)
-        # 添加图片，占满整张幻灯片
-        slide.shapes.add_picture(
-            str(img_path),
-            Inches(0), Inches(0),
-            width=prs.slide_width,
-            height=prs.slide_height
-        )
-        print(f"   ✓ 第{i}页: {img_path.name}")
-    
-    prs.save(str(output_path))
-    print(f"✅ PPTX 创建完成: {output_path} ({orientation})")
+def save_final_pptx_files(raw_pptx_paths: Dict[str, Path], output_dir: Path, notebook_title: str) -> Dict[str, Path]:
+    """保存 NotebookLM 原始导出的 PPTX 文件到最终输出目录。"""
+    name_map = {
+        "landscape_part1": f"{notebook_title}_横版_前半.pptx",
+        "landscape_part2": f"{notebook_title}_横版_后半.pptx",
+        "portrait_part1": f"{notebook_title}_竖版_前半.pptx",
+        "portrait_part2": f"{notebook_title}_竖版_后半.pptx",
+    }
+
+    saved_paths = {}
+    for key, src in raw_pptx_paths.items():
+        if key not in name_map:
+            raise KeyError(f"未知的 PPTX 类型: {key}")
+        dst = output_dir / name_map[key]
+        shutil.copy2(src, dst)
+        saved_paths[key] = dst
+
+    return saved_paths
 
 # ═══════════════════════════════════════════════════════════════════════
 # Logo 遮盖工具
@@ -561,10 +541,6 @@ def draw_disclaimer(
 def check_dependencies() -> List[str]:
     """检查运行依赖，返回缺失项列表"""
     missing = []
-    try:
-        import python_pptx  # noqa: F401
-    except ImportError:
-        missing.append("python-pptx (pip install python-pptx)")
     try:
         from PIL import Image  # noqa: F401
     except ImportError:
@@ -1012,14 +988,28 @@ def main(
         pptx_v1 = download_with_fallback("PPT 3（竖版前半）", ppt3_artifact_id, "ppt_v1.pptx", excluded_ids)
         pptx_v2 = download_with_fallback("PPT 4（竖版后半）", ppt4_artifact_id, "ppt_v2.pptx", excluded_ids)
         
-        # ─── Step 8: 合并 PPTX（横版 + 竖版分别合并）─────────────────
-        step_timer("8.合并+图片")
-        print("\n[8/10] 合并 PPTX 并提取图片...")
+        # ─── Step 8: 保存原始 PPTX + 提取图片───────────────────────────
+        step_timer("8.保存PPT+图片")
+        print("\n[8/10] 保存原始 PPTX 并提取图片...")
         
         # 创建输出目录（尊重 --output-dir 参数）
         final_output_dir = output_dir if output_dir else DEFAULT_OUTPUT_DIR / notebook_title
         final_output_dir.mkdir(parents=True, exist_ok=True)
         print(f"   📁 输出目录: {final_output_dir}")
+
+        final_pptx_files = save_final_pptx_files(
+            {
+                "landscape_part1": pptx_h1,
+                "landscape_part2": pptx_h2,
+                "portrait_part1": pptx_v1,
+                "portrait_part2": pptx_v2,
+            },
+            final_output_dir,
+            notebook_title,
+        )
+        print("   📦 已保存原始 PPTX 文件：")
+        for key in ["landscape_part1", "landscape_part2", "portrait_part1", "portrait_part2"]:
+            print(f"      - {final_pptx_files[key].name}")
         
         # ── 横版处理 ────────────────────────────────────────────────
         print("\n   📐 处理横版 PPT（16:9）...")
@@ -1054,8 +1044,6 @@ def main(
             print("      ⏭️ 跳过 Logo 遮盖（Logo 文件不存在）")
         print("      → 绘制横版免责声明...")
         draw_disclaimer(images_dir_h, orientation="landscape")
-        final_pptx_h = final_output_dir / f"{notebook_title}_横版.pptx"
-        create_pptx_from_images(all_images_h, final_pptx_h, orientation="landscape")
         
         # ── 竖版处理 ────────────────────────────────────────────────
         print("\n   📱 处理竖版 PPT（9:16）...")
@@ -1090,11 +1078,9 @@ def main(
             print("      ⏭️ 跳过 Logo 遮盖（Logo 文件不存在）")
         print("      → 绘制竖版免责声明...")
         draw_disclaimer(images_dir_v, orientation="portrait")
-        final_pptx_v = final_output_dir / f"{notebook_title}_竖版.pptx"
-        create_pptx_from_images(all_images_v, final_pptx_v, orientation="portrait")
         
         # ─── Step 9: Logo 遮盖（已在 Step 8 中完成）────────────────────
-        print("\n[9/10] Logo 遮盖已完成（合并前执行）")
+        print("\n[9/10] Logo 遮盖与免责声明绘制已完成（仅作用于图片）")
         
         # ─── Step 10: 清理 ──────────────────────────────────────────
         print("\n[10/10] 清理临时文件...")
@@ -1119,26 +1105,28 @@ def main(
             print(f"   ⚠️ {w}")
 
         # ─── 完成 ───────────────────────────────────────────────────
+        step_timer("done")
+        total_sec = time.time() - run_start
+
         print("\n" + "="*60)
         print(f"✅ 流水线完成！（耗时 {total_sec:.0f}s，run_id={run_id}）")
-        print(f"   📦 横版 PPTX: {final_pptx_h}")
-        print(f"   📦 竖版 PPTX: {final_pptx_v}")
+        print("   📦 原始 PPTX:")
+        print(f"      - {final_pptx_files['landscape_part1']}")
+        print(f"      - {final_pptx_files['landscape_part2']}")
+        print(f"      - {final_pptx_files['portrait_part1']}")
+        print(f"      - {final_pptx_files['portrait_part2']}")
         print(f"   🖼️  横版图片: {images_dir_h} ({h_count}/{pages} 张)")
         print(f"   🖼️  竖版图片: {images_dir_v} ({v_count}/{pages} 张)")
         if warnings:
             print(f"   ⚠️ 警告: {len(warnings)} 项")
         print("="*60)
 
-        step_timer("done")
-        total_sec = time.time() - run_start
-
         result = {
             "status": "ok" if not warnings else "partial",
             "run_id": run_id,
             "total_seconds": round(total_sec, 1),
             "step_times": {name: round(sec, 1) for name, sec in step_times},
-            "pptx_landscape": str(final_pptx_h),
-            "pptx_portrait": str(final_pptx_v),
+            "pptx_files": {key: str(path) for key, path in final_pptx_files.items()},
             "images_dir_landscape": str(images_dir_h),
             "images_dir_portrait": str(images_dir_v),
             "page_count_landscape": h_count,

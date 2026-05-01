@@ -3,12 +3,12 @@
 MD → 视频口播稿 + 配音 一体化流水线
 
 Step 5: 读取PPT图片 + MD原文 → mimo-v2.5-pro 生成口播稿
-Step 6: 口播稿 → MiMo VoiceClone TTS → ffmpeg 1.5倍速
+Step 6: 口播稿 → MiMo VoiceClone TTS → ffmpeg 1.5倍速 + 双声道
 
 输出：
   - V1-P1.txt ~ V3-P10.txt（每页口播稿）
   - V1-开场.txt, V1-结尾.txt, ...（视频开场结尾）
-  - V1-P1.wav ~ V3-P10.wav（每页配音，1.5倍速）
+  - V1-P1.wav ~ V3-P10.wav（每页配音，1.5倍速 + 双声道）
   - 合集-开场.txt, 合集-结尾.txt
 
 用法:
@@ -472,11 +472,16 @@ class VoiceCloneTTS:
 
 def speed_up_audio(input_path: Path, output_path: Path, speed: float = SPEED) -> bool:
     result = subprocess.run(
-        ["ffmpeg", "-y", "-i", str(input_path), "-filter:a", f"atempo={speed}", str(output_path)],
+        [
+            "ffmpeg", "-y", "-i", str(input_path),
+            "-filter:a", f"atempo={speed}",
+            "-ac", "2",
+            str(output_path),
+        ],
         capture_output=True,
     )
     if result.returncode != 0:
-        print(f"   ⚠️ ffmpeg 加速失败: {result.stderr.decode()[:200]}")
+        print(f"   ⚠️ ffmpeg 加速/双声道处理失败: {result.stderr.decode()[:200]}")
         return False
     return True
 

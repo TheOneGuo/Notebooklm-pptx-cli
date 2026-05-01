@@ -33,7 +33,6 @@ TOOLS.md
 USER.md
 
 # Test/temp files
-test_*.py
 test-md-step1.md
 example_usage.py
 voice_sample_script.txt
