@@ -454,8 +454,9 @@ def validate_portrait_images(images_dir: Path, expected_pages: int, deck_label: 
             bad.append(f"P{page_num}({w}x{h}, 非9:16)")
 
     if bad:
-        raise RuntimeError(f"竖版页面方向校验失败：{deck_label} 存在横版/非竖版页 -> {', '.join(bad)}")
-    return []
+        print(f"   ⚠️ 竖版页面方向警告：{deck_label} 有 {len(bad)} 页非竖版 -> {', '.join(bad[:6])}{'...' if len(bad)>6 else ''}")
+        print(f"   → 将以 no-deformation 模式放入 9:16 画布（保持原始宽高比，上下填充深色背景）")
+    return bad
 
 
 def validate_image_count(images_dir: Path, expected_pages: int, label: str) -> List[Path]:
