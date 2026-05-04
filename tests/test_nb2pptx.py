@@ -96,6 +96,25 @@ def test_validate_portrait_images_detects_landscape_pages(tmp_path):
     assert "1376x768" in message
 
 
+def test_create_pptx_from_images_preserves_image_aspect_ratio(tmp_path):
+    from pptx import Presentation
+
+    image_path = tmp_path / "P1.png"
+    write_png(image_path, (1600, 900))
+    output_path = tmp_path / "portrait.pptx"
+
+    nb2pptx.create_pptx_from_images([image_path], output_path, orientation="portrait")
+
+    prs = Presentation(str(output_path))
+    slide = prs.slides[0]
+    picture = slide.shapes[0]
+
+    assert len(prs.slides) == 1
+    assert picture.width / picture.height == pytest.approx(1600 / 900, rel=0.01)
+    assert not (picture.width == prs.slide_width and picture.height == prs.slide_height)
+    assert picture.height == prs.slide_height
+
+
 def test_main_generates_merged_30_page_outputs_and_postprocessed_images(tmp_path, monkeypatch):
     md_file = tmp_path / "input.md"
     md_file.write_text("# 报告\n\n内容", encoding="utf-8")

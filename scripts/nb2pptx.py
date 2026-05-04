@@ -100,6 +100,59 @@ def build_notebooklm_env() -> Dict[str, str]:
     return env
 
 
+def ensure_notebooklm_library_network_patch(cli_path: Path) -> None:
+    """Patch the installed notebooklm package used by the CLI so httpx honors proxy env."""
+    python_path = cli_path.parent / "python"
+    if not python_path.exists():
+        return
+
+    patch_code = r'''
+from pathlib import Path
+import importlib.util
+import re
+
+spec = importlib.util.find_spec("notebooklm")
+if not spec or not spec.submodule_search_locations:
+    raise SystemExit(0)
+pkg = Path(next(iter(spec.submodule_search_locations)))
+
+def patch_file(name, replacements):
+    path = pkg / name
+    if not path.exists():
+        return False
+    text = path.read_text(encoding="utf-8")
+    original = text
+    for old, new in replacements:
+        text = text.replace(old, new)
+    if name == "_core.py":
+        text = re.sub(r"DEFAULT_TIMEOUT\s*=\s*[0-9.]+", "DEFAULT_TIMEOUT = 120.0", text)
+    if text != original:
+        path.write_text(text, encoding="utf-8")
+    return True
+
+patch_file("_core.py", [
+    ("DEFAULT_CONNECT_TIMEOUT = 10.0", "DEFAULT_CONNECT_TIMEOUT = 10.0"),
+    ("httpx.AsyncClient(\n                headers=headers,\n                timeout=timeout,\n                proxy=proxy_url,\n            )",
+     "httpx.AsyncClient(\n                headers=headers,\n                timeout=timeout,\n                proxy=proxy_url,\n                trust_env=True,\n            )"),
+])
+patch_file("auth.py", [
+    ("async with httpx.AsyncClient() as client:", "async with httpx.AsyncClient(trust_env=True, timeout=120.0) as client:"),
+    ("timeout=30.0,", "timeout=120.0,"),
+])
+patch_file("_sources.py", [
+    ("httpx.AsyncClient(timeout=60.0)", "httpx.AsyncClient(timeout=120.0, trust_env=True)"),
+    ("httpx.AsyncClient(timeout=300.0)", "httpx.AsyncClient(timeout=300.0, trust_env=True)"),
+])
+patch_file("_artifacts.py", [
+    ("timeout=60.0,\n        ) as client:", "timeout=60.0,\n            trust_env=True,\n        ) as client:"),
+    ("timeout=timeout,\n            ) as client:", "timeout=timeout,\n                trust_env=True,\n            ) as client:"),
+])
+'''
+    result = subprocess.run([str(python_path), "-c", patch_code], capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        raise RuntimeError(f"NotebookLM httpx 代理补丁失败: {result.stderr.strip()}")
+
+
 def chrome_debug_ready(port: int = CHROME_DEBUG_PORT) -> bool:
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2) as resp:
@@ -397,12 +450,13 @@ def copy_images_with_expected_count(
 
 
 def create_pptx_from_images(images: List[Path], output_path: Path, orientation: str = "landscape") -> None:
-    """用 NotebookLM 原始导出图片生成 30 页 PPTX；图片后处理不回写到 PPTX。"""
+    """用 NotebookLM 原始导出图片生成 PPTX；cover 模式保持宽高比且不留黑边。"""
     try:
         from pptx import Presentation
         from pptx.util import Inches
+        from PIL import Image
     except ImportError:
-        print("❌ 需要安装 python-pptx: pip install python-pptx")
+        print("❌ 需要安装 python-pptx 和 Pillow")
         sys.exit(1)
 
     prs = Presentation()
@@ -416,20 +470,34 @@ def create_pptx_from_images(images: List[Path], output_path: Path, orientation: 
     blank_layout = prs.slide_layouts[6]
     for image_path in images:
         slide = prs.slides.add_slide(blank_layout)
+        with Image.open(image_path) as img:
+            img_w, img_h = img.size
+        image_ratio = img_w / img_h
+        slide_ratio = prs.slide_width / prs.slide_height
+        if image_ratio > slide_ratio:
+            pic_h = prs.slide_height
+            pic_w = int(pic_h * image_ratio)
+            left = int((prs.slide_width - pic_w) / 2)
+            top = 0
+        else:
+            pic_w = prs.slide_width
+            pic_h = int(pic_w / image_ratio)
+            left = 0
+            top = int((prs.slide_height - pic_h) / 2)
         slide.shapes.add_picture(
             str(image_path),
-            Inches(0),
-            Inches(0),
-            width=prs.slide_width,
-            height=prs.slide_height,
+            left,
+            top,
+            width=pic_w,
+            height=pic_h,
         )
 
     prs.save(str(output_path))
     print(f"✅ PPTX 创建完成: {output_path} ({len(images)}页, {orientation})")
 
 
-def validate_portrait_images(images_dir: Path, expected_pages: int, deck_label: str = "竖版", page_numbers: Optional[List[int]] = None) -> List[str]:
-    """校验竖版导出图片是 9:16 纵向，不接受横版页。"""
+def find_bad_portrait_pages(images_dir: Path, expected_pages: int, page_numbers: Optional[List[int]] = None) -> List[Dict]:
+    """找出非竖版或比例明显不对的页面。"""
     try:
         from PIL import Image
     except ImportError:
@@ -438,7 +506,7 @@ def validate_portrait_images(images_dir: Path, expected_pages: int, deck_label: 
 
     images = sorted(images_dir.glob("P*.png"), key=lambda p: int(p.stem[1:]))
     if len(images) != expected_pages:
-        raise RuntimeError(f"{deck_label} 图片数 {len(images)} ≠ 预期 {expected_pages}")
+        raise RuntimeError(f"竖版图片数 {len(images)} ≠ 预期 {expected_pages}")
 
     bad = []
     allowed = set(page_numbers or [])
@@ -449,13 +517,18 @@ def validate_portrait_images(images_dir: Path, expected_pages: int, deck_label: 
         with Image.open(image_path) as img:
             w, h = img.size
         if h <= w:
-            bad.append(f"P{page_num}({w}x{h})")
+            bad.append({"page": page_num, "width": w, "height": h})
         elif h / w < 1.55:
-            bad.append(f"P{page_num}({w}x{h}, 非9:16)")
+            bad.append({"page": page_num, "width": w, "height": h})
+    return bad
 
+
+def validate_portrait_images(images_dir: Path, expected_pages: int, deck_label: str = "竖版", page_numbers: Optional[List[int]] = None) -> List[Dict]:
+    """严格校验竖版导出图片是 9:16 纵向，不接受横版页。"""
+    bad = find_bad_portrait_pages(images_dir, expected_pages, page_numbers)
     if bad:
-        print(f"   ⚠️ 竖版页面方向警告：{deck_label} 有 {len(bad)} 页非竖版 -> {', '.join(bad[:6])}{'...' if len(bad)>6 else ''}")
-        print(f"   → 将以 no-deformation 模式放入 9:16 画布（保持原始宽高比，上下填充深色背景）")
+        details = ", ".join(f"P{x['page']}({x['width']}x{x['height']})" for x in bad[:8])
+        raise RuntimeError(f"竖版页面方向校验失败：{deck_label} 存在横版/非竖版页 -> {details}")
     return bad
 
 
@@ -721,6 +794,7 @@ def main(
 
     # 初始化
     cli_path = find_notebooklm_cli()
+    ensure_notebooklm_library_network_patch(cli_path)
     if check_chrome:
         ensure_chrome_debug_session()
     nb = NotebookLM(cli_path)
@@ -968,6 +1042,46 @@ def main(
             if not artifact_id:
                 print(f"   ⚠️ {task_name} artifact ID 获取失败（10次重试均未找到），将在下载阶段尝试方案C")
                 return None, excluded_ids
+            print(f"   ⚠️ {task_name} 暂未出现在 artifact 列表，保留返回 ID 继续等待: {artifact_id}")
+            return artifact_id, excluded_ids
+
+        def submit_single_portrait_page(page_number: int, excluded_ids: set) -> str:
+            prompt = f'''[LANGUAGE: CHINESE ONLY - 禁止使用任何英文]
+
+请只重新生成 1 页竖版 PPT：对应总大纲的第 {page_number} 页。
+
+【强制要求】
+- 只生成 1 页，不要生成标题页、目录页或额外页面。
+- 必须是原生 9:16 竖版设计，页面高度明显大于宽度。
+- 不得把横版页面、横版图片、横向宽图、横向仪表盘压缩进竖版画布。
+- 不得使用上下黑边、暗色填充或等比缩小横版图的方式冒充竖版。
+- 内容必须与来源b第 {page_number} 页的主题、标题含义、公司/股票/数据一致。
+- 采用移动端竖向叙事：标题在上、核心结论纵向分层、图表单列或上下堆叠。
+- 不要自行添加任何页脚或免责声明，程序会统一绘制。
+
+【PPT标识】这是竖版单页重做，页码 P{page_number}。'''
+            artifact_id, _ = submit_and_track(f"P{page_number} 竖版单页重做", prompt, excluded_ids)
+            if not artifact_id:
+                raise RuntimeError(f"P{page_number} 竖版单页重做未能绑定 artifact")
+            return artifact_id
+
+        def wait_for_artifact_ready(label: str, artifact_id: str, timeout_seconds: float) -> None:
+            start = time.time()
+            while True:
+                if time.time() - start > timeout_seconds:
+                    raise RuntimeError(f"{label} 等待完成超时（{timeout_seconds}s）")
+                result = nb.run(["artifact", "list", "-n", notebook_id, "--json"], timeout=30)
+                artifact_map = {a.get("id"): a for a in result.get("artifacts", [])}
+                artifact = artifact_map.get(artifact_id)
+                if artifact:
+                    status_code = artifact.get("status", 0)
+                    if status_code == 3:
+                        print(f"   ✅ {label} 已完成")
+                        return
+                    if status_code == 4:
+                        raise RuntimeError(f"{label} 生成失败")
+                    print(f"   → {label} 当前状态: {STATUS_MAP.get(status_code, status_code)}")
+                time.sleep(60)
         
         # 按顺序提交 4 个任务，每个都追踪 artifact ID
         # PPT 1（横版前半）
@@ -1007,10 +1121,10 @@ def main(
             time.sleep(initial_interval)
         
         poll_count = 0
-        ppt1_completed = ppt1_artifact_id is None
-        ppt2_completed = ppt2_artifact_id is None
-        ppt3_completed = ppt3_artifact_id is None
-        ppt4_completed = ppt4_artifact_id is None
+        ppt1_completed = False
+        ppt2_completed = False
+        ppt3_completed = False
+        ppt4_completed = False
         
         while not (ppt1_completed and ppt2_completed and ppt3_completed and ppt4_completed):
             elapsed = time.time() - start_time
@@ -1023,6 +1137,27 @@ def main(
             
             # 创建 ID -> artifact 的映射
             artifact_map = {a.get("id"): a for a in artifacts}
+
+            def bind_missing(current_id, task_label):
+                if current_id:
+                    return current_id
+                assigned_ids = {x for x in [ppt1_artifact_id, ppt2_artifact_id, ppt3_artifact_id, ppt4_artifact_id] if x}
+                candidates = [
+                    a for a in artifacts
+                    if a.get("kind") == "slide_deck"
+                    and a.get("id") not in initial_artifact_ids
+                    and a.get("id") not in assigned_ids
+                ]
+                if not candidates:
+                    return None
+                picked = candidates[0].get("id")
+                print(f"   ✅ {task_label} 迟到 artifact 已绑定: {picked[:8]}...")
+                return picked
+
+            ppt1_artifact_id = bind_missing(ppt1_artifact_id, "PPT 1（横版前半）")
+            ppt2_artifact_id = bind_missing(ppt2_artifact_id, "PPT 2（横版后半）")
+            ppt3_artifact_id = bind_missing(ppt3_artifact_id, "PPT 3（竖版前半）")
+            ppt4_artifact_id = bind_missing(ppt4_artifact_id, "PPT 4（竖版后半）")
             
             # 检查 PPT 1 状态
             if not ppt1_completed and ppt1_artifact_id and ppt1_artifact_id in artifact_map:
@@ -1091,6 +1226,7 @@ def main(
             if artifact_id:
                 path = nb.download_slides(temp_dir / temp_name, artifact_id, notebook_id)
                 print(f"   ✅ {task_label}: {path.name}")
+                excluded_ids_set.add(artifact_id)
                 return path
             
             # 方案C：通过内容识别
@@ -1171,6 +1307,38 @@ def main(
         _, warnings_v2 = copy_images_with_expected_count(images_v2, raw_images_v, pages_per_deck + 1, pages - pages_per_deck, "竖版后半")
         warnings.extend(warnings_v1 + warnings_v2)
         raw_all_images_v = validate_image_count(raw_images_v, pages, "竖版")
+        bad_portrait_pages = find_bad_portrait_pages(raw_images_v, pages)
+        if bad_portrait_pages:
+            rerender_excluded_ids = set(initial_artifact_ids) | {
+                x for x in [ppt1_artifact_id, ppt2_artifact_id, ppt3_artifact_id, ppt4_artifact_id] if x
+            }
+            print(f"   ⚠️ 竖版发现 {len(bad_portrait_pages)} 页横版/非竖版，将逐页单独重做")
+            for item in bad_portrait_pages:
+                page_number = item["page"]
+                print(f"      ↻ 重做竖版 P{page_number}（原尺寸 {item['width']}x{item['height']}）")
+                rerender_artifact_id = submit_single_portrait_page(page_number, rerender_excluded_ids)
+                rerender_excluded_ids.add(rerender_artifact_id)
+                wait_for_artifact_ready(f"P{page_number} 竖版单页重做", rerender_artifact_id, timeout)
+                rerender_pptx = nb.download_slides(temp_dir / f"portrait_rerender_P{page_number}.pptx", rerender_artifact_id, notebook_id)
+                rerender_extract_dir = temp_dir / f"extract_portrait_rerender_P{page_number}"
+                rerender_extract_dir.mkdir(exist_ok=True)
+                rerender_images = extract_images_from_pptx(rerender_pptx, rerender_extract_dir)
+                copied, rerender_warnings = copy_images_with_expected_count(
+                    rerender_images,
+                    raw_images_v,
+                    page_number,
+                    1,
+                    f"竖版 P{page_number} 单页重做",
+                )
+                warnings.extend(rerender_warnings)
+                replacement_bad = find_bad_portrait_pages(raw_images_v, pages, page_numbers=[page_number])
+                if replacement_bad:
+                    detail = replacement_bad[0]
+                    raise RuntimeError(
+                        f"竖版 P{page_number} 单页重做后仍非竖版: {detail['width']}x{detail['height']}"
+                    )
+                print(f"      ✅ P{page_number} 已替换为 {copied[0].name}")
+            raw_all_images_v = validate_image_count(raw_images_v, pages, "竖版")
         validate_portrait_images(raw_images_v, pages, "竖版")
         create_pptx_from_images(raw_all_images_v, final_pptx_v, orientation="portrait")
         if count_pptx_slides(final_pptx_v) != pages:
