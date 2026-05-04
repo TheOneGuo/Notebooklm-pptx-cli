@@ -939,8 +939,8 @@ def main(
             ], timeout=30)
             
             artifact_id = result.get("artifact_id") or result.get("task_id")
-            for retry in range(5):
-                time.sleep(3 + retry * 2)
+            for retry in range(10):
+                time.sleep(5 + retry * 3)
                 artifacts_resp = nb.run(["artifact", "list", "-n", notebook_id, "--json"], timeout=30)
                 artifacts_list = artifacts_resp.get("artifacts", [])
                 artifact_ids = {a.get("id") for a in artifacts_list}
@@ -963,11 +963,11 @@ def main(
                     new_excluded = excluded_ids | {a.get("id") for a in artifacts_list}
                     return artifact_id, new_excluded
                 else:
-                    print(f"   ⚠️ 第{retry+1}次查询未找到 {task_name} artifact，{'重试中...' if retry < 4 else '将在下载后检查内容'}")
+                    print(f"   ⚠️ 第{retry+1}次查询未找到 {task_name} artifact，{'重试中...' if retry < 9 else '将在下载后检查内容'}")
             
             if not artifact_id:
-                raise RuntimeError(f"{task_name} artifact ID 获取失败（5次重试均未找到），中止")
-            return artifact_id, excluded_ids
+                print(f"   ⚠️ {task_name} artifact ID 获取失败（10次重试均未找到），将在下载阶段尝试方案C")
+                return None, excluded_ids
         
         # 按顺序提交 4 个任务，每个都追踪 artifact ID
         # PPT 1（横版前半）
