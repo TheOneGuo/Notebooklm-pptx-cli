@@ -1145,6 +1145,8 @@ def main(
         raw_images_h.mkdir(exist_ok=True)
         h1_extract_dir = temp_dir / "extract_h1"
         h2_extract_dir = temp_dir / "extract_h2"
+        h1_extract_dir.mkdir(exist_ok=True)
+        h2_extract_dir.mkdir(exist_ok=True)
         images_h1 = extract_images_from_pptx(pptx_h1, h1_extract_dir)
         _, warnings_h1 = copy_images_with_expected_count(images_h1, raw_images_h, 1, pages_per_deck, "横版前半")
         images_h2 = extract_images_from_pptx(pptx_h2, h2_extract_dir)
@@ -1160,6 +1162,8 @@ def main(
         raw_images_v.mkdir(exist_ok=True)
         v1_extract_dir = temp_dir / "extract_v1"
         v2_extract_dir = temp_dir / "extract_v2"
+        v1_extract_dir.mkdir(exist_ok=True)
+        v2_extract_dir.mkdir(exist_ok=True)
         images_v1 = extract_images_from_pptx(pptx_v1, v1_extract_dir)
         _, warnings_v1 = copy_images_with_expected_count(images_v1, raw_images_v, 1, pages_per_deck, "竖版前半")
         images_v2 = extract_images_from_pptx(pptx_v2, v2_extract_dir)
