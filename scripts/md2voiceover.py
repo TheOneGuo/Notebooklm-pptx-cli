@@ -88,7 +88,7 @@ class MiMoScriptGenerator:
 {md_content[:3000]}
 
 严格输出JSON，无其他内容：
-{{"report_title":"标题","videos":[{{"title":"V1标题","pages":"1-{page_count//3}","theme":"主题","钩子":"钩子"}},{{"title":"V2标题","pages":"{page_count//3+1}-{page_count*2//3}","theme":"主题","hook":"钩子"}},{{"title":"V3标题","pages":"{page_count*2//3+1}-{page_count}","theme":"主题","hook":"钩子"}}]}}"""
+{{"report_title":"标题","videos":[{{"title":"V1标题","pages":"1-{page_count//3}","theme":"主题","hook":"钩子"}},{{"title":"V2标题","pages":"{page_count//3+1}-{page_count*2//3}","theme":"主题","hook":"钩子"}},{{"title":"V3标题","pages":"{page_count*2//3+1}-{page_count}","theme":"主题","hook":"钩子"}}]}}"""
 
         result = self._call([{"role": "user", "content": split_prompt}], max_tokens=4096)
 
@@ -428,8 +428,9 @@ def generate_all_scripts(md_path: Path, images_dir: Path, output_dir: Path):
                 prev_ending = all_scripts[prev_key]
 
         print(f"   V{vid_num} 开场...", end="", flush=True)
+        hook = v.get("hook") or v.get("钩子") or ""
         opening = gen.generate_video_opening(
-            v["title"], v["theme"], v["hook"], vid_num, prev_ending
+            v["title"], v["theme"], hook, vid_num, prev_ending
         )
         all_scripts[f"V{vid_num}-开场.txt"] = opening
         (output_dir / f"V{vid_num}-开场.txt").write_text(opening)
