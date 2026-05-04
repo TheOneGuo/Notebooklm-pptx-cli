@@ -52,21 +52,21 @@ pip install -r requirements.txt
 ### 使用方法
 
 ```bash
-# 完整流水线：MD → PPT（默认 30 页）
-python scripts/nb2pptx.py your_report.md
+# 完整流水线：MD → PPT（默认 30 页；建议 -u 关闭输出缓冲）
+python -u scripts/nb2pptx.py your_report.md
 
 # 自定义参数
-python scripts/nb2pptx.py your_report.md \
+python -u scripts/nb2pptx.py your_report.md \
     --title "AI算力液冷赛道报告" \
-    --pages 40 \
+    --pages 30 \
     --output-dir ~/Desktop/output \
     --logo ~/path/to/logo.png \
     --keep-temp
 
 # 口播稿生成 + 语音合成
 python scripts/md2voiceover.py \
-    --md your_report.md \
-    --images ~/Documents/A股研报/报告名/images_landscape/ \
+    your_report.md \
+    --images-dir ~/Documents/A股研报/报告名/images_landscape/ \
     --output-dir ~/Documents/A股研报/报告名/配音/
 ```
 
@@ -82,7 +82,7 @@ python scripts/md2voiceover.py \
 | `--keep-temp` | - | `false` | 保留临时文件（调试用） |
 | `--initial-interval` | - | `540` | 初始等待秒数 |
 | `--max-interval` | - | `60` | 轮询间隔秒数 |
-| `--timeout` | - | `900` | 总超时秒数 |
+| `--timeout` | - | `1800` | 总超时秒数 |
 
 ---
 
@@ -108,10 +108,8 @@ Notebooklm-pptx-cli/
 
 ```
 ~/Documents/A股研报/<笔记本名称>/
-├── <笔记本名称>_横版_前半.pptx     # NotebookLM 原始横版前半
-├── <笔记本名称>_横版_后半.pptx     # NotebookLM 原始横版后半
-├── <笔记本名称>_竖版_前半.pptx     # NotebookLM 原始竖版前半
-├── <笔记本名称>_竖版_后半.pptx     # NotebookLM 原始竖版后半
+├── <笔记本名称>_横版.pptx         # 横版 30 页（PPT1 P1-P15 + PPT2 P16-P30）
+├── <笔记本名称>_竖版.pptx         # 竖版 30 页（PPT3 P1-P15 + PPT4 P16-P30）
 ├── images_landscape/               # 横版图片（P1.png ~ P30.png）
 ├── images_portrait/                # 竖版图片（P1.png ~ P30.png）
 ├── run_result.json                 # 运行结果（含耗时、PPT 路径、警告等）
@@ -198,7 +196,7 @@ Step 10 清理临时文件 + 删除 NotebookLM 笔记本
 **🔧 改进**
 - PPT 提示词去重：4 段 ~90% 重复的 prompt 提取为 `build_ppt_prompt()` 公共函数
 - 前置依赖检查：启动时检查 python-pptx、Pillow、ffmpeg，缺失时给出明确提示
-- Logo 遮盖顺序修正：在 PPTX 创建**前**先遮盖图片，确保最终 PPTX 中的图片已覆盖
+- PPTX 与图片后处理分离：PPTX 使用后处理前图片生成 30 页横/竖版；Logo 遮盖和免责声明只作用于 `images_*` 视频素材
 - `--output-dir` 参数真正生效（之前被硬编码忽略）
 - 步骤计时：每个 Step 打印耗时，结束时汇总
 
@@ -243,8 +241,8 @@ Step 10 清理临时文件 + 删除 NotebookLM 笔记本
 |------|------|
 | 总页数 | 不超过 40 页（4 任务并行资源占用大） |
 | 初始等待 | 540s（9 分钟静默等待 NotebookLM 生成） |
-| 总超时 | 900s（15 分钟） |
-| Chrome Debug | 需保持运行（端口 9222），用于反爬绕过 |
+| 总超时 | 1800s（30 分钟） |
+| Chrome Debug | 脚本会检查/启动独立 Profile 的 9222 端口；首次需在该窗口登录 Google / NotebookLM |
 
 ---
 

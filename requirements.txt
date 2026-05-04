@@ -11,5 +11,8 @@ openai>=1.0.0
 # NotebookLM CLI（通过 pip 安装）
 notebooklm-cli>=0.1.0
 
+# 测试
+pytest>=8.0.0
+
 # 系统依赖（需手动安装，非 pip）
 # brew install ffmpeg   — 用于音频 1.5x 加速

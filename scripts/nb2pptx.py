@@ -19,9 +19,9 @@ NotebookLM MD → PPTX 完整流水线
     4. 生成 PPT 大纲笔记
     5. 笔记转为来源
     6. 并行生成 4 个 PPT（横版PPT1/PPT2 + 竖版PPT3/PPT4）
-    7. 下载并分别合并横版和竖版 PPTX
-    8. 提取图片（images_landscape/ + images_portrait/）
-    9. 遮盖 NotebookLM Logo
+    7. 下载横版/竖版前后半 PPTX
+    8. 生成横版 30 页和竖版 30 页 PPTX + 提取图片
+    9. 遮盖 NotebookLM Logo + 绘制免责声明（仅作用于图片）
     10. 清理临时文件
 """
 
@@ -29,12 +29,20 @@ import argparse
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except AttributeError:
+    pass
 
 # ═══════════════════════════════════════════════════════════════════════
 # 配置
@@ -60,8 +68,89 @@ DEFAULT_OUTPUT_DIR = Path.home() / "Documents" / "A股研报"
 DEFAULT_WAIT_CONFIG = {
     "initial_interval": 540,  # 9分钟静默等待
     "max_interval": 60,        # 后续每分钟轮询
-    "timeout": 900,            # 15分钟总超时
+    "timeout": 1800,           # 30分钟总超时
 }
+CHROME_DEBUG_PORT = int(os.environ.get("NOTEBOOKLM_CHROME_PORT", "9222"))
+CHROME_PROFILE_DIR = Path(os.environ.get("NOTEBOOKLM_CHROME_PROFILE", Path.home() / ".qclaw" / "notebooklm-chrome-profile"))
+COMMON_PROXY_PORTS = (7890, 7897, 7899, 7891)
+
+
+def _can_connect(host: str, port: int, timeout: float = 0.4) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def build_notebooklm_env() -> Dict[str, str]:
+    """构建 NotebookLM CLI 环境，确保 httpx 能读到 Clash 等本地代理。"""
+    env = os.environ.copy()
+    has_proxy = any(env.get(k) for k in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"))
+    if not has_proxy:
+        for port in COMMON_PROXY_PORTS:
+            if _can_connect("127.0.0.1", port):
+                proxy = f"http://127.0.0.1:{port}"
+                env["HTTP_PROXY"] = proxy
+                env["HTTPS_PROXY"] = proxy
+                env["ALL_PROXY"] = proxy
+                env.setdefault("NO_PROXY", "127.0.0.1,localhost,::1")
+                print(f"🌐 检测到本地代理端口 {port}，NotebookLM CLI 将使用 {proxy}")
+                break
+    return env
+
+
+def chrome_debug_ready(port: int = CHROME_DEBUG_PORT) -> bool:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def find_chrome_executable() -> Optional[Path]:
+    candidates = [
+        Path(os.environ["CHROME_PATH"]) if os.environ.get("CHROME_PATH") else None,
+        Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        Path("/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary"),
+        Path("/Applications/Chromium.app/Contents/MacOS/Chromium"),
+    ]
+    for candidate in candidates:
+        if candidate and candidate.exists():
+            return candidate
+    return None
+
+
+def ensure_chrome_debug_session(port: int = CHROME_DEBUG_PORT, profile_dir: Path = CHROME_PROFILE_DIR) -> None:
+    """确保 9222 上有独立 Chrome Profile 的远程调试会话。"""
+    if chrome_debug_ready(port):
+        print(f"✅ Chrome Debug 端口 {port} 已可用")
+        return
+
+    chrome = find_chrome_executable()
+    if not chrome:
+        raise RuntimeError("未找到 Google Chrome，请先安装或通过 CHROME_PATH 指定可执行文件")
+
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        str(chrome),
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "https://notebooklm.google.com/",
+    ]
+    print(f"🌐 Chrome Debug 端口 {port} 未响应，正在启动独立 Profile: {profile_dir}")
+    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        if chrome_debug_ready(port):
+            print(f"✅ Chrome Debug 端口 {port} 已启动；如未登录，请在该 Chrome 窗口登录 Google / NotebookLM 后重跑")
+            return
+        time.sleep(1)
+
+    raise RuntimeError(f"Chrome 已启动但 127.0.0.1:{port} 仍未响应，请确认远程调试窗口未被系统阻止")
 
 # ═══════════════════════════════════════════════════════════════════════
 # CLI 执行工具
@@ -72,15 +161,17 @@ class NotebookLM:
     
     def __init__(self, cli_path: Path):
         self.cli = str(cli_path)
+        self.env = build_notebooklm_env()
     
-    def run(self, args: List[str], timeout: int = 30, check: bool = True) -> Dict:
+    def run(self, args: List[str], timeout: int = 120, check: bool = True) -> Dict:
         """执行 CLI 命令，返回 JSON 结果"""
         cmd = [self.cli] + args
         result = subprocess.run(
             cmd, 
             capture_output=True, 
             text=True, 
-            timeout=timeout
+            timeout=timeout,
+            env=self.env,
         )
         
         if check and result.returncode != 0:
@@ -139,63 +230,10 @@ class NotebookLM:
             "-n", notebook_id
         ])
     
-    # ─── Ask 操作 ────────────────────────────────────────────────────
-    
-    def ask_and_save(self, question: str, notebook_id: str, note_title: str, source_id: str = None) -> str:
-        """提问并保存为笔记，返回 note_id"""
-        cmd = [
-            "ask", question,
-            "-n", notebook_id,
-            "--save-as-note",
-            "--note-title", note_title,
-        ]
-        if source_id:
-            cmd.extend(["--source", source_id])
-        
-        # ask --save-as-note 不返回 JSON，使用原始输出
-        result = subprocess.run(
-            [self.cli] + cmd,
-            capture_output=True,
-            text=True,
-            timeout=180
-        )
-        
-        if result.returncode != 0:
-            raise RuntimeError(f"ask 命令失败: {result.stderr}")
-        
-        # 通过 notes list 找到刚创建的笔记
-        notes_result = self.run(["notes", "list", "-n", notebook_id], timeout=30)
-        for note in notes_result.get("notes", []):
-            if note.get("title") == note_title:
-                return note.get("id")
-        
-        return ""
-    
     def get_note_content(self, note_id: str, notebook_id: str) -> str:
         """获取笔记内容"""
         result = self.run(["notes", "get", note_id, "-n", notebook_id, "--json"], timeout=30)
         return result.get("content", "")
-    
-    # ─── PPT 生成 ────────────────────────────────────────────────────
-    
-    def generate_slides(
-        self, 
-        source_id: str, 
-        notebook_id: str,
-        instructions: str,
-        fmt: str = "detailed_deck"
-    ) -> str:
-        """生成 PPT（不等待），返回 task ID"""
-        result = self.run([
-            "generate", "slide-deck",
-            "--source", source_id,
-            "--instructions", instructions,
-            "--format", fmt,
-            "--no-wait",
-            "-n", notebook_id,
-            "--json"
-        ], timeout=30)
-        return result.get("task_id")
     
     def download_slides(
         self, 
@@ -317,44 +355,114 @@ def extract_images_from_pptx(pptx_path: Path, output_dir: Path) -> List[Path]:
     
     return images
 
+def prepare_upload_source(md_file: Path, temp_dir: Path) -> Path:
+    """复制为 ASCII 临时文件上传，避免中文路径/文件名导致 NotebookLM CLI 失败。"""
+    upload_path = temp_dir / "source.md"
+    shutil.copy2(md_file, upload_path)
+    return upload_path
+
+
+def count_pptx_slides(pptx_path: Path) -> int:
+    try:
+        from pptx import Presentation
+    except ImportError:
+        print("❌ 需要安装 python-pptx: pip install python-pptx")
+        sys.exit(1)
+    return len(Presentation(str(pptx_path)).slides)
+
+
+def copy_images_with_expected_count(
+    extracted_images: List[Path],
+    output_dir: Path,
+    start_page: int,
+    expected_count: int,
+    deck_label: str,
+) -> Tuple[List[Path], List[str]]:
+    """按目标页码复制图片，少页中止，多页只保留前 expected_count 页。"""
+    ordered = sorted(extracted_images, key=lambda x: int(x.stem[1:]))
+    if len(ordered) < expected_count:
+        raise RuntimeError(f"{deck_label} 图片数 {len(ordered)} < 预期 {expected_count}，丢页中止")
+    warnings = []
+    if len(ordered) > expected_count:
+        warnings.append(f"{deck_label} 图片数 {len(ordered)} > 预期 {expected_count}，仅保留前 {expected_count} 页")
+        ordered = ordered[:expected_count]
+
+    copied = []
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for offset, image_path in enumerate(ordered):
+        target = output_dir / f"P{start_page + offset}.png"
+        shutil.copy2(image_path, target)
+        copied.append(target)
+    return copied, warnings
+
+
 def create_pptx_from_images(images: List[Path], output_path: Path, orientation: str = "landscape") -> None:
-    """从图片创建 PPTX
-    
-    参数:
-        images: 图片路径列表
-        output_path: 输出 PPTX 路径
-        orientation: 方向 - "landscape"(横版 16:9) 或 "portrait"(竖版 9:16)
-    """
+    """用 NotebookLM 原始导出图片生成 30 页 PPTX；图片后处理不回写到 PPTX。"""
     try:
         from pptx import Presentation
         from pptx.util import Inches
     except ImportError:
         print("❌ 需要安装 python-pptx: pip install python-pptx")
         sys.exit(1)
-    
+
     prs = Presentation()
     if orientation == "portrait":
-        prs.slide_width = Inches(7.5)   # 9:16 竖版
+        prs.slide_width = Inches(7.5)
         prs.slide_height = Inches(13.333)
     else:
-        prs.slide_width = Inches(13.333)  # 16:9 横版
+        prs.slide_width = Inches(13.333)
         prs.slide_height = Inches(7.5)
-    
-    blank_layout = prs.slide_layouts[6]  # 空白布局
-    
-    for i, img_path in enumerate(images, 1):
+
+    blank_layout = prs.slide_layouts[6]
+    for image_path in images:
         slide = prs.slides.add_slide(blank_layout)
-        # 添加图片，占满整张幻灯片
         slide.shapes.add_picture(
-            str(img_path),
-            Inches(0), Inches(0),
+            str(image_path),
+            Inches(0),
+            Inches(0),
             width=prs.slide_width,
-            height=prs.slide_height
+            height=prs.slide_height,
         )
-        print(f"   ✓ 第{i}页: {img_path.name}")
-    
+
     prs.save(str(output_path))
-    print(f"✅ PPTX 创建完成: {output_path} ({orientation})")
+    print(f"✅ PPTX 创建完成: {output_path} ({len(images)}页, {orientation})")
+
+
+def validate_portrait_images(images_dir: Path, expected_pages: int, deck_label: str = "竖版", page_numbers: Optional[List[int]] = None) -> List[str]:
+    """校验竖版导出图片是 9:16 纵向，不接受横版页。"""
+    try:
+        from PIL import Image
+    except ImportError:
+        print("❌ 需要安装 Pillow: pip install Pillow")
+        sys.exit(1)
+
+    images = sorted(images_dir.glob("P*.png"), key=lambda p: int(p.stem[1:]))
+    if len(images) != expected_pages:
+        raise RuntimeError(f"{deck_label} 图片数 {len(images)} ≠ 预期 {expected_pages}")
+
+    bad = []
+    allowed = set(page_numbers or [])
+    for image_path in images:
+        page_num = int(image_path.stem[1:])
+        if allowed and page_num not in allowed:
+            continue
+        with Image.open(image_path) as img:
+            w, h = img.size
+        if h <= w:
+            bad.append(f"P{page_num}({w}x{h})")
+        elif h / w < 1.55:
+            bad.append(f"P{page_num}({w}x{h}, 非9:16)")
+
+    if bad:
+        raise RuntimeError(f"竖版页面方向校验失败：{deck_label} 存在横版/非竖版页 -> {', '.join(bad)}")
+    return []
+
+
+def validate_image_count(images_dir: Path, expected_pages: int, label: str) -> List[Path]:
+    images = sorted(images_dir.glob("P*.png"), key=lambda x: int(x.stem[1:]))
+    if len(images) != expected_pages:
+        raise RuntimeError(f"{label} 图片数 {len(images)} ≠ 预期 {expected_pages}，丢页中止")
+    return images
 
 # ═══════════════════════════════════════════════════════════════════════
 # Logo 遮盖工具
@@ -509,14 +617,9 @@ def draw_disclaimer(
             text_h = sum(line_heights) + 4  # 行间距
             line_spacing = 4
 
-            if orientation == "landscape":
-                # 横版：右下角对齐
-                text_x = img_w - text_w - margin - 10
-                text_y = img_h - text_h - margin - 4
-            else:
-                # 竖版：底部居中
-                text_x = (img_w - text_w) // 2
-                text_y = img_h - text_h - margin - 4
+            # 横版和竖版都只放在页面正中底部，避免右下角重复免责声明。
+            text_x = (img_w - text_w) // 2
+            text_y = img_h - text_h - margin - 4
 
             # 绘制半透明背景
             pad = 6
@@ -535,13 +638,9 @@ def draw_disclaimer(
             # 绘制文字
             y_offset = text_y
             for i, line in enumerate(disclaimer_lines):
-                if orientation == "landscape":
-                    draw.text((text_x, y_offset), line, fill=text_color, font=font)
-                else:
-                    # 竖版居中
-                    line_w = line_widths[i]
-                    lx = text_x + (text_w - line_w) // 2
-                    draw.text((lx, y_offset), line, fill=text_color, font=font)
+                line_w = line_widths[i]
+                lx = text_x + (text_w - line_w) // 2
+                draw.text((lx, y_offset), line, fill=text_color, font=font)
                 y_offset += line_heights[i] + line_spacing
 
             img.convert("RGB").save(str(img_path), optimize=True)
@@ -580,6 +679,7 @@ def main(
     logo_path: Optional[Path] = None,
     keep_temp: bool = False,
     wait_config: Optional[Dict] = None,
+    check_chrome: bool = True,
 ):
     """
     完整流水线：MD → NotebookLM → PPTX → 图片 → Logo 遮盖
@@ -595,6 +695,11 @@ def main(
     if md_file.stat().st_size == 0:
         print(f"❌ 输入文件为空: {md_file}")
         sys.exit(1)
+    if pages <= 0 or pages % 2 != 0:
+        print("❌ --pages 必须是正偶数；当前流程需要前半/后半各一份 PPT")
+        sys.exit(1)
+    if pages != 30:
+        print(f"⚠️ 当前视频拆分流程按 30 页验收；本次使用 {pages} 页，请确认这是预期行为")
 
     # 参数处理
     title = title or md_file.stem
@@ -615,10 +720,13 @@ def main(
 
     # 初始化
     cli_path = find_notebooklm_cli()
+    if check_chrome:
+        ensure_chrome_debug_session()
     nb = NotebookLM(cli_path)
     
     notebook_id = None
-    temp_dir = None
+    temp_dir = Path(tempfile.mkdtemp(prefix="nb2pptx_"))
+    print(f"📂 临时目录: {temp_dir}")
     notebook_title = title  # 初始化为 title，后续会被步骤3重命名
     run_id = time.strftime("%Y%m%d_%H%M%S")
     run_start = time.time()
@@ -646,7 +754,9 @@ def main(
         # ─── Step 2: 上传 MD 作为来源并重命名为 a ────────────────────
         step_timer("2.上传来源")
         print("\n[2/10] 上传 MD 文件作为来源...")
-        source_a_id, source_a_title = nb.add_source_file(md_file, notebook_id)
+        upload_md_file = prepare_upload_source(md_file, temp_dir)
+        print(f"   → 使用 ASCII 临时文件上传，规避中文路径问题: {upload_md_file.name}")
+        source_a_id, source_a_title = nb.add_source_file(upload_md_file, notebook_id)
         if not source_a_id:
             raise RuntimeError("上传来源失败：返回空 source ID")
         print(f"   ✅ 来源上传成功: {source_a_title} ({source_a_id})")
@@ -693,9 +803,9 @@ def main(
 
 【风格要求】PPT设计风格采用高端商务黑金/暗黑机械风格。背景使用深邃黑与暗灰色渐变，营造沉浸式暗室感。主体图表必须呈现 3D 拟物化的哑光红铜/古铜金属材质。图表边缘需带有亮金色流光特效。整体画面需传达出极度沉稳、权威、严谨与精密的质感。
 
-【免责声明】所有页面底部必须显示以下文字（分两行）：
-市场有风险，决策需独立；
-股市有风险，入市需谨慎。'''
+【页码要求】第1页必须是标题页；第16页必须承接第15页，从来源b大纲的第16页内容继续，不能重新开始。
+
+【免责声明】不要在大纲或 PPT 画面里自行添加任何免责声明、页脚免责声明或右下角免责声明；程序会在导出的图片正中底部统一绘制。'''
         
         note_title = f"{pages}页PPT大纲"
         
@@ -707,7 +817,7 @@ def main(
             "--source", source_a_id,
             "--save-as-note",
             "--note-title", note_title
-        ], timeout=300)  # 5 分钟超时
+        ], timeout=900)  # 大报告可能超过 58KB，允许更长时间
         
         print(f"   ✅ 大纲笔记已生成")
         
@@ -770,9 +880,11 @@ def main(
                 label = "横版"
             else:
                 layout_rule = (
-                    "必须严格使用竖版（9:16）纵向布局。页面高度明显大于宽度（高宽比约为1.77:1），"
-                    "适合手机端短视频展示。所有内容必须纵向排列：大标题在页面上方，正文和图表垂直向下展开，"
-                    "左右留白对称，充分利用竖向空间。严禁使用横版布局。"
+                    "必须原生设计为竖版（9:16）纵向布局，页面高度明显大于宽度（高宽比约为1.77:1），"
+                    "适合手机端短视频展示。必须重新按竖版排版和设计，不得把横版页面、横版图片、横向四栏仪表盘、"
+                    "横向宽表或横向长图压缩进竖版画布；也不得把横版内容等比缩小后上下留黑边/暗色填充。"
+                    "所有内容必须采用移动端原生纵向叙事：大标题在上方，核心结论分层向下展开，图表改为单列、双层、"
+                    "上下堆叠卡片、纵向流程或竖向对比。宁可减少同屏元素，也不能压缩文字、人物、图表或图片。"
                 )
                 label = "竖版"
 
@@ -794,9 +906,9 @@ def main(
 
 【风格要求】采用高端商务黑金/暗黑机械风格。背景使用深邃黑与暗灰色渐变，营造沉浸式暗室感。主体图表（如结构图、流程图）必须呈现 3D 拟物化的哑光红铜/古铜金属材质，避免亮金色。图表边缘需带有亮金色流光特效。整体画面需传达出极度沉稳、权威、严谨与精密的质感。
 
-【免责声明】所有页面底部必须显示以下文字（分两行）：
-市场有风险，决策需独立；
-股市有风险，入市需谨慎。
+【页码闭环】PPT 1 和 PPT 3 都必须覆盖来源b大纲的第1-{pages_per_deck}页，其中第1页是标题页；PPT 2 和 PPT 4 都必须覆盖第{pages_per_deck + 1}-{pages}页，其中第{pages_per_deck + 1}页是第{pages_per_deck}页之后的续篇，不能重新做标题页。横版和竖版每一页的主题、标题含义、公司/股票/数据必须一一对应，只允许版式和视觉设计不同。
+
+【免责声明】不要自行添加任何页脚、免责声明或右下角小字；程序会在导出的图片正中底部统一绘制。
 
 【内容要求】要求插图丰富，确保每个中文字不要出错，字体清晰。研报中提到的所有公司名称、股票代码、核心数据必须在PPT中明确体现，不得遗漏。{content_verb}来源b要求的第{page_start}-{page_end}页{consistency}。
 
@@ -825,11 +937,17 @@ def main(
                 "--json"
             ], timeout=30)
             
-            artifact_id = None
+            artifact_id = result.get("artifact_id") or result.get("task_id")
             for retry in range(5):
                 time.sleep(3 + retry * 2)
                 artifacts_resp = nb.run(["artifact", "list", "-n", notebook_id, "--json"], timeout=30)
                 artifacts_list = artifacts_resp.get("artifacts", [])
+                artifact_ids = {a.get("id") for a in artifacts_list}
+
+                if artifact_id and artifact_id in artifact_ids:
+                    status = next(a.get("status") for a in artifacts_list if a.get("id") == artifact_id)
+                    print(f"   ✅ {task_name} artifact 已绑定: {artifact_id[:8]}... (状态: {status})")
+                    return artifact_id, excluded_ids | {artifact_id}
                 
                 new_artifacts = [
                     a for a in artifacts_list
@@ -967,10 +1085,6 @@ def main(
         step_timer("7.下载PPT")
         print("\n[7/10] 下载 PPT...")
         
-        # 创建临时目录
-        temp_dir = Path(tempfile.mkdtemp(prefix="nb2pptx_"))
-        print(f"   📂 临时目录: {temp_dir}")
-        
         def download_with_fallback(task_label, artifact_id, temp_name, excluded_ids_set):
             """下载 PPT，如果 ID 缺失则通过内容识别"""
             if artifact_id:
@@ -1012,39 +1126,61 @@ def main(
         pptx_v1 = download_with_fallback("PPT 3（竖版前半）", ppt3_artifact_id, "ppt_v1.pptx", excluded_ids)
         pptx_v2 = download_with_fallback("PPT 4（竖版后半）", ppt4_artifact_id, "ppt_v2.pptx", excluded_ids)
         
-        # ─── Step 8: 合并 PPTX（横版 + 竖版分别合并）─────────────────
+        # ─── Step 8: 生成 30 页 PPTX + 提取图片 ──────────────────────
         step_timer("8.合并+图片")
-        print("\n[8/10] 合并 PPTX 并提取图片...")
+        print("\n[8/10] 生成 30 页横版/竖版 PPTX，并提取视频图片...")
         
         # 创建输出目录（尊重 --output-dir 参数）
         final_output_dir = output_dir if output_dir else DEFAULT_OUTPUT_DIR / notebook_title
         final_output_dir.mkdir(parents=True, exist_ok=True)
         print(f"   📁 输出目录: {final_output_dir}")
         
-        # ── 横版处理 ────────────────────────────────────────────────
-        print("\n   📐 处理横版 PPT（16:9）...")
+        final_pptx_h = final_output_dir / f"{notebook_title}_横版.pptx"
+        final_pptx_v = final_output_dir / f"{notebook_title}_竖版.pptx"
+
+        warnings = []
+
+        print("\n   📐 处理横版 PPT（PPT1 P1-P15 + PPT2 P16-P30）...")
+        raw_images_h = temp_dir / "raw_images_landscape"
+        raw_images_h.mkdir(exist_ok=True)
+        h1_extract_dir = temp_dir / "extract_h1"
+        h2_extract_dir = temp_dir / "extract_h2"
+        images_h1 = extract_images_from_pptx(pptx_h1, h1_extract_dir)
+        _, warnings_h1 = copy_images_with_expected_count(images_h1, raw_images_h, 1, pages_per_deck, "横版前半")
+        images_h2 = extract_images_from_pptx(pptx_h2, h2_extract_dir)
+        _, warnings_h2 = copy_images_with_expected_count(images_h2, raw_images_h, pages_per_deck + 1, pages - pages_per_deck, "横版后半")
+        warnings.extend(warnings_h1 + warnings_h2)
+        raw_all_images_h = validate_image_count(raw_images_h, pages, "横版")
+        create_pptx_from_images(raw_all_images_h, final_pptx_h, orientation="landscape")
+        if count_pptx_slides(final_pptx_h) != pages:
+            raise RuntimeError(f"横版 PPTX 页数 {count_pptx_slides(final_pptx_h)} ≠ 预期 {pages}")
+
+        print("\n   📱 处理竖版 PPT（PPT3 P1-P15 + PPT4 P16-P30）...")
+        raw_images_v = temp_dir / "raw_images_portrait"
+        raw_images_v.mkdir(exist_ok=True)
+        v1_extract_dir = temp_dir / "extract_v1"
+        v2_extract_dir = temp_dir / "extract_v2"
+        images_v1 = extract_images_from_pptx(pptx_v1, v1_extract_dir)
+        _, warnings_v1 = copy_images_with_expected_count(images_v1, raw_images_v, 1, pages_per_deck, "竖版前半")
+        images_v2 = extract_images_from_pptx(pptx_v2, v2_extract_dir)
+        _, warnings_v2 = copy_images_with_expected_count(images_v2, raw_images_v, pages_per_deck + 1, pages - pages_per_deck, "竖版后半")
+        warnings.extend(warnings_v1 + warnings_v2)
+        raw_all_images_v = validate_image_count(raw_images_v, pages, "竖版")
+        validate_portrait_images(raw_images_v, pages, "竖版")
+        create_pptx_from_images(raw_all_images_v, final_pptx_v, orientation="portrait")
+        if count_pptx_slides(final_pptx_v) != pages:
+            raise RuntimeError(f"竖版 PPTX 页数 {count_pptx_slides(final_pptx_v)} ≠ 预期 {pages}")
+
+        # ── 横版视频图片后处理 ───────────────────────────────────────
+        print("\n   📐 生成横版视频图片（16:9）...")
         images_dir_h = final_output_dir / "images_landscape"
+        if images_dir_h.exists():
+            shutil.rmtree(images_dir_h)
         images_dir_h.mkdir(exist_ok=True)
-        
-        print("      → 提取 PPT 1（横版前半）图片...")
-        images_h1 = extract_images_from_pptx(pptx_h1, images_dir_h)
-        print(f"      ✅ 提取 {len(images_h1)} 张")
-        
-        print("      → 提取 PPT 2（横版后半）图片...")
-        temp_dir_h2 = temp_dir / "images_h2"
-        temp_dir_h2.mkdir(exist_ok=True)
-        images_h2 = extract_images_from_pptx(pptx_h2, temp_dir_h2)
-        
-        # 重命名并移动（接在 h1 后面）
-        for img in images_h2:
-            new_name = f"P{len(images_h1) + int(img.stem[1:])}.png"
-            img.rename(images_dir_h / new_name)
-        print(f"      ✅ 提取 {len(images_h2)} 张")
-        
-        # 横版页数校验
-        all_images_h = sorted(images_dir_h.glob("P*.png"), key=lambda x: int(x.stem[1:]))
-        if len(all_images_h) != pages:
-            raise RuntimeError(f"横版图片数 {len(all_images_h)} ≠ 预期 {pages}，丢页中止")
+        for image_path in raw_all_images_h:
+            shutil.copy2(image_path, images_dir_h / image_path.name)
+        all_images_h = validate_image_count(images_dir_h, pages, "横版")
+
         if logo_path:
             print("      → 遮盖横版 NotebookLM Logo...")
             cover_h = cover_logo_on_images(images_dir_h, logo_path)
@@ -1054,33 +1190,18 @@ def main(
             print("      ⏭️ 跳过 Logo 遮盖（Logo 文件不存在）")
         print("      → 绘制横版免责声明...")
         draw_disclaimer(images_dir_h, orientation="landscape")
-        final_pptx_h = final_output_dir / f"{notebook_title}_横版.pptx"
-        create_pptx_from_images(all_images_h, final_pptx_h, orientation="landscape")
-        
-        # ── 竖版处理 ────────────────────────────────────────────────
-        print("\n   📱 处理竖版 PPT（9:16）...")
+
+        # ── 竖版视频图片后处理 ───────────────────────────────────────
+        print("\n   📱 生成竖版视频图片（9:16）...")
         images_dir_v = final_output_dir / "images_portrait"
+        if images_dir_v.exists():
+            shutil.rmtree(images_dir_v)
         images_dir_v.mkdir(exist_ok=True)
-        
-        print("      → 提取 PPT 3（竖版前半）图片...")
-        images_v1 = extract_images_from_pptx(pptx_v1, images_dir_v)
-        print(f"      ✅ 提取 {len(images_v1)} 张")
-        
-        print("      → 提取 PPT 4（竖版后半）图片...")
-        temp_dir_v2 = temp_dir / "images_v2"
-        temp_dir_v2.mkdir(exist_ok=True)
-        images_v2 = extract_images_from_pptx(pptx_v2, temp_dir_v2)
-        
-        # 重命名并移动（接在 v1 后面）
-        for img in images_v2:
-            new_name = f"P{len(images_v1) + int(img.stem[1:])}.png"
-            img.rename(images_dir_v / new_name)
-        print(f"      ✅ 提取 {len(images_v2)} 张")
-        
-        # 竖版页数校验
-        all_images_v = sorted(images_dir_v.glob("P*.png"), key=lambda x: int(x.stem[1:]))
-        if len(all_images_v) != pages:
-            raise RuntimeError(f"竖版图片数 {len(all_images_v)} ≠ 预期 {pages}，丢页中止")
+        for image_path in raw_all_images_v:
+            shutil.copy2(image_path, images_dir_v / image_path.name)
+        all_images_v = validate_image_count(images_dir_v, pages, "竖版")
+        validate_portrait_images(images_dir_v, pages, "竖版")
+
         if logo_path:
             print("      → 遮盖竖版 NotebookLM Logo...")
             cover_v = cover_logo_on_images(images_dir_v, logo_path)
@@ -1090,11 +1211,9 @@ def main(
             print("      ⏭️ 跳过 Logo 遮盖（Logo 文件不存在）")
         print("      → 绘制竖版免责声明...")
         draw_disclaimer(images_dir_v, orientation="portrait")
-        final_pptx_v = final_output_dir / f"{notebook_title}_竖版.pptx"
-        create_pptx_from_images(all_images_v, final_pptx_v, orientation="portrait")
         
-        # ─── Step 9: Logo 遮盖（已在 Step 8 中完成）────────────────────
-        print("\n[9/10] Logo 遮盖已完成（合并前执行）")
+        # ─── Step 9: 图片后处理完成 ─────────────────────────────────
+        print("\n[9/10] 图片后处理已完成（PPTX 使用后处理前图片生成，不再用遮盖/免责声明后的图片重组）")
         
         # ─── Step 10: 清理 ──────────────────────────────────────────
         print("\n[10/10] 清理临时文件...")
@@ -1114,11 +1233,13 @@ def main(
         # ─── 页数校验 ───────────────────────────────────────────────────
         h_count = len(all_images_h)
         v_count = len(all_images_v)
-        warnings = []
         for w in warnings:
             print(f"   ⚠️ {w}")
 
         # ─── 完成 ───────────────────────────────────────────────────
+        step_timer("done")
+        total_sec = time.time() - run_start
+
         print("\n" + "="*60)
         print(f"✅ 流水线完成！（耗时 {total_sec:.0f}s，run_id={run_id}）")
         print(f"   📦 横版 PPTX: {final_pptx_h}")
@@ -1128,9 +1249,6 @@ def main(
         if warnings:
             print(f"   ⚠️ 警告: {len(warnings)} 项")
         print("="*60)
-
-        step_timer("done")
-        total_sec = time.time() - run_start
 
         result = {
             "status": "ok" if not warnings else "partial",
@@ -1200,12 +1318,14 @@ if __name__ == "__main__":
                         help=f"Logo 底图路径（默认 {DEFAULT_LOGO_PATH}）")
     parser.add_argument("--keep-temp", action="store_true",
                         help="保留临时文件（调试用）")
+    parser.add_argument("--skip-chrome-check", action="store_true",
+                        help="跳过 Chrome 9222 远程调试检查（仅调试用）")
     parser.add_argument("--initial-interval", type=int, default=540,
                         help="初始等待时间/秒（默认 540）")
     parser.add_argument("--max-interval", type=int, default=60,
                         help="轮询间隔/秒（默认 60）")
-    parser.add_argument("--timeout", type=int, default=900,
-                        help="总超时/秒（默认 900）")
+    parser.add_argument("--timeout", type=int, default=1800,
+                        help="总超时/秒（默认 1800）")
     
     args = parser.parse_args()
     
@@ -1229,4 +1349,5 @@ if __name__ == "__main__":
         logo_path=args.logo,
         keep_temp=args.keep_temp,
         wait_config=wait_config,
+        check_chrome=not args.skip_chrome_check,
     )

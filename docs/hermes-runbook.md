@@ -86,8 +86,9 @@
 - 把 MD 导入 NotebookLM
 - 生成大纲、来源 B、四个 PPT 任务
 - 下载四个 NotebookLM 原始 PPTX
+- 组合为横版 30 页和竖版 30 页 PPTX
 - 提取横版/竖版图片
-- 对图片做 logo 遮盖和免责声明绘制
+- 对图片做 logo 遮盖和免责声明绘制（不再把后处理图片回写 PPTX）
 - 输出 `run_result.json`
 
 输入：
@@ -95,10 +96,8 @@
 - 可选标题 / 页数 / 输出目录 / logo 路径
 
 输出：
-- `<标题>_横版_前半.pptx`
-- `<标题>_横版_后半.pptx`
-- `<标题>_竖版_前半.pptx`
-- `<标题>_竖版_后半.pptx`
+- `<标题>_横版.pptx`
+- `<标题>_竖版.pptx`
 - `images_landscape/`
 - `images_portrait/`
 - `run_result.json`
@@ -225,7 +224,8 @@ cd /tmp/Notebooklm-pptx-cli
 python3 scripts/nb2pptx.py /absolute/path/to/report.md \
   --title "报告标题" \
   --pages 30 \
-  --output-dir "$HOME/Documents/A股研报/报告标题"
+  --output-dir "$HOME/Documents/A股研报/报告标题" \
+  --timeout 1800
 ```
 
 如需保留临时文件调试：
@@ -262,12 +262,12 @@ python3 scripts/nb2pptx.py \
 ```bash
 cd /tmp/Notebooklm-pptx-cli
 python3 scripts/md2voiceover.py \
-  --md /absolute/path/to/report.md \
-  --images "$HOME/Documents/A股研报/报告标题/images_landscape" \
+  /absolute/path/to/report.md \
+  --images-dir "$HOME/Documents/A股研报/报告标题/images_landscape" \
   --output-dir "$HOME/Documents/A股研报/报告标题/配音"
 ```
 
-如果要对竖版图片配音，也可以把 `--images` 切到 `images_portrait/`。
+如果要对竖版图片配音，也可以把 `--images-dir` 切到 `images_portrait/`。
 
 ---
 
